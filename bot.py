@@ -28,7 +28,7 @@ TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "false").lower() == "
 TRAILING_STOP = float(os.getenv("TRAILING_STOP_PCT", "0.15"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "75"))
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
-MIN_SOL_PAIR_LIQUIDITY_USD = max(20000.0, float(os.getenv("MIN_SOL_PAIR_LIQUIDITY_USD", "7500")))
+MIN_SOL_PAIR_LIQUIDITY_USD = max(10000.0, float(os.getenv("MIN_SOL_PAIR_LIQUIDITY_USD", "1000")))
 MIN_VOLUME_5M_USD = float(os.getenv("MIN_VOLUME_5M_USD", "1000"))
 MAX_PAIR_AGE_HOURS = float(os.getenv("MAX_PAIR_AGE_HOURS", "6"))
 MIN_PAIR_AGE_MINUTES = float(os.getenv("MIN_PAIR_AGE_MINUTES", "5"))
