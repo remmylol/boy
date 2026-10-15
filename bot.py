@@ -19,7 +19,7 @@ PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "10"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
 POSITION_SIZE_USD = float(os.getenv("POSITION_SIZE_USD", "10"))  # Fixed paper position size in USD
-MAX_DAILY_LOSS_FRACTION = float(os.getenv("MAX_DAILY_LOSS_FRACTION", "0.30"))
+MAX_DAILY_LOSS_FRACTION = float(os.getenv("MAX_DAILY_LOSS_FRACTION", "0.99"))
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", "0.50"))
 STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.20"))
 TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "false").lower() == "true"
