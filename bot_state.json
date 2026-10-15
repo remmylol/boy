@@ -1,9 +1,9 @@
 {
-  "cash_usd": 200.0,
+  "cash_usd": 36.0,
   "positions": {},
   "closed_trades": [],
   "day": "2026-10-15",
-  "day_start_equity": 200.0,
+  "day_start_equity": 36.0,
   "halted": false,
   "seen_tokens": []
 }
