@@ -27,10 +27,10 @@ STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.33"))
 TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "false").lower() == "true"
 TRAILING_STOP = float(os.getenv("TRAILING_STOP_PCT", "0.15"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "75"))
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "15000"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "20000"))
 MIN_SOL_PAIR_LIQUIDITY_USD = max(20000.0, float(os.getenv("MIN_SOL_PAIR_LIQUIDITY_USD", "20000")))
-MIN_VOLUME_5M_USD = float(os.getenv("MIN_VOLUME_5M_USD", "5000"))
-MAX_PAIR_AGE_HOURS = float(os.getenv("MAX_PAIR_AGE_HOURS", "3"))
+MIN_VOLUME_5M_USD = float(os.getenv("MIN_VOLUME_5M_USD", "1000"))
+MAX_PAIR_AGE_HOURS = float(os.getenv("MAX_PAIR_AGE_HOURS", "48"))
 MAX_SLIPPAGE_BPS = int(os.getenv("MAX_SLIPPAGE_BPS", "150"))
 MAX_STALE_PRICE_SECONDS = int(os.getenv("MAX_STALE_PRICE_SECONDS", "60"))
 # Fee/slippage haircut used for paper-trade estimates. Actual costs vary.
