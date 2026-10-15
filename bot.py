@@ -18,21 +18,21 @@ load_dotenv()
 # ---- Configuration ----
 STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL_USD", "36"))
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "20"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "5"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
-POSITION_SIZE_USD = float(os.getenv("POSITION_SIZE_USD", "10"))  # Fixed paper position size in USD
-MAX_DAILY_LOSS_FRACTION = float(os.getenv("MAX_DAILY_LOSS_FRACTION", "0.05"))
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", "0.50"))
-STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.20"))
+POSITION_SIZE_USD = float(os.getenv("POSITION_SIZE_USD", "15"))  # Fixed paper position size in USD
+MAX_DAILY_LOSS_FRACTION = float(os.getenv("MAX_DAILY_LOSS_FRACTION", "0.5"))
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", "0.33"))
+STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.33"))
 TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "false").lower() == "true"
 TRAILING_STOP = float(os.getenv("TRAILING_STOP_PCT", "0.15"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "75"))
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "15000"))
-MIN_SOL_PAIR_LIQUIDITY_USD = max(20000.0, float(os.getenv("MIN_SOL_PAIR_LIQUIDITY_USD", "20000")))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
+MIN_SOL_PAIR_LIQUIDITY_USD = max(20000.0, float(os.getenv("MIN_SOL_PAIR_LIQUIDITY_USD", "7500")))
 MIN_VOLUME_5M_USD = float(os.getenv("MIN_VOLUME_5M_USD", "1000"))
-MAX_PAIR_AGE_HOURS = float(os.getenv("MAX_PAIR_AGE_HOURS", "168"))
+MAX_PAIR_AGE_HOURS = float(os.getenv("MAX_PAIR_AGE_HOURS", "2.5"))
 MAX_SLIPPAGE_BPS = int(os.getenv("MAX_SLIPPAGE_BPS", "150"))
-MAX_STALE_PRICE_SECONDS = int(os.getenv("MAX_STALE_PRICE_SECONDS", "120"))
+MAX_STALE_PRICE_SECONDS = int(os.getenv("MAX_STALE_PRICE_SECONDS", "60"))
 # Fee/slippage haircut used for paper-trade estimates. Actual costs vary.
 ESTIMATED_ROUND_TRIP_COST = float(os.getenv("ESTIMATED_ROUND_TRIP_COST", "0.04"))
 
