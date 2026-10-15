@@ -11,6 +11,7 @@ def test_discovery_search_adds_solana_mints(monkeypatch):
     bot._discovery_cache.update(until=0, addresses=[])
     monkeypatch.setattr(bot, 'get_json', lambda url: [{'chainId': 'solana', 'tokenAddress': 'A'}])
     class Response:
+        status_code = 200
         def raise_for_status(self): pass
         def json(self):
             return {'pairs': [{'chainId': 'solana', 'baseToken': {'address': 'B'}},
