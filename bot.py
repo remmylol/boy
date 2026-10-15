@@ -23,7 +23,7 @@ MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
 POSITION_SIZE_USD = float(os.getenv("POSITION_SIZE_USD", "15"))  # Fixed paper position size in USD
 MAX_DAILY_LOSS_FRACTION = float(os.getenv("MAX_DAILY_LOSS_FRACTION", "0.5"))
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", "0.20"))
-STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.07"))
+STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.35"))
 TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "false").lower() == "true"
 TRAILING_STOP = float(os.getenv("TRAILING_STOP_PCT", "0.15"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "75"))
@@ -39,7 +39,7 @@ MOMENTUM_MAX_CHANGE_5M_PCT = float(os.getenv("MOMENTUM_MAX_CHANGE_5M_PCT", "15")
 MOMENTUM_MIN_TXNS_5M = int(os.getenv("MOMENTUM_MIN_TXNS_5M", "40"))
 MOMENTUM_MIN_BUY_SELL_RATIO = float(os.getenv("MOMENTUM_MIN_BUY_SELL_RATIO", "1.5"))
 MOMENTUM_MIN_VOLUME_LIQUIDITY_RATIO = float(os.getenv("MOMENTUM_MIN_VOLUME_LIQUIDITY_RATIO", "0.15"))
-MAX_HOLD_MINUTES = float(os.getenv("MAX_HOLD_MINUTES", "15"))
+MAX_HOLD_MINUTES = float(os.getenv("MAX_HOLD_MINUTES", "5"))
 MAX_SLIPPAGE_BPS = int(os.getenv("MAX_SLIPPAGE_BPS", "150"))
 MAX_STALE_PRICE_SECONDS = int(os.getenv("MAX_STALE_PRICE_SECONDS", "60"))
 # Fee/slippage haircut used for paper-trade estimates. Actual costs vary.
