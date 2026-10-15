@@ -8,7 +8,7 @@ from datetime import datetime, timezone, date
 from pathlib import Path
 from typing import Any
 from live_execution import execute_buy, execute_sell
-log.info("EXECUTION BRIDGE LOADED — preview only, live trading disabled")
+print("EXECUTION BRIDGE LOADED - preview only, live trading disabled", flush=True)
 
 import requests
 from dotenv import load_dotenv
