@@ -1,0 +1,3 @@
+2026-10-15 12:40:39,201 CRITICAL PAPER_MODE=false, but this release has no live swap signer. Refusing to trade live.
+2026-10-15 12:40:39,201 CRITICAL Set PAPER_MODE=true. Live mode requires a separately reviewed Jupiter swap adapter.
+2026-10-15 12:40:39,816 CRITICAL LIVE_TRADING_ENABLED must remain false for this staged strategy release. Refusing to start.
