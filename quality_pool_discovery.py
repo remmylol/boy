@@ -4,6 +4,7 @@ Discovery hints only: execution eligibility is ALWAYS rechecked with DexScreener
 """
 from __future__ import annotations
 import math
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -37,7 +38,8 @@ def extract_quality_pool_mints(payload: dict, *, sol_mint: str,
                                sniper_min_txns_5m: int = 12,
                                sniper_max_change_5m_pct: float = 80.0,
                                sniper_min_age_minutes: float = 1.0,
-                               discovery_stage: str = "strict") -> dict[str, float]:
+                               discovery_stage: str = "strict",
+                               rejection_counts: Counter | None = None) -> dict[str, float]:
     """Select SOL-quoted, supported-DEX, priced liquid pools, by base mint.
 
     Never assume symbols are authoritative; compare the exact SOL mint.
@@ -48,8 +50,12 @@ def extract_quality_pool_mints(payload: dict, *, sol_mint: str,
     included = {i.get("id"): i for i in payload.get("included", [])
                 if isinstance(i, dict) and isinstance(i.get("id"), str)}
     results: dict[str, float] = {}
+    def reject(reason: str) -> None:
+        if rejection_counts is not None:
+            rejection_counts[reason] += 1
     for pool in payload.get("data", []):
         if not isinstance(pool, dict):
+            reject("invalid_pool_record")
             continue
         attr = pool.get("attributes") or {}
         rel = pool.get("relationships") or {}
@@ -60,15 +66,24 @@ def extract_quality_pool_mints(payload: dict, *, sol_mint: str,
         # GeckoTerminal may use e.g. pump_swap; normalize punctuation only.
         dex = dex.replace("_", "").replace("-", "")
         if dex not in supported_dexes:
+            reject("unsupported_dex")
             continue
         base = _token_address(rel.get("base_token"), included)
         quote = _token_address(rel.get("quote_token"), included)
         if not base or base == sol_mint or quote != sol_mint:
+            reject("not_base_token_sol_quote")
             continue
         liq = _number(attr.get("reserve_in_usd"))
         v1h = _number((attr.get("volume_usd") or {}).get("h1"))
         price = _number(attr.get("base_token_price_usd"))
-        if liq < min_liquidity_usd or v1h < min_volume_1h_usd or price <= 0:
+        if liq < min_liquidity_usd:
+            reject("below_minimum_liquidity")
+            continue
+        if v1h < min_volume_1h_usd:
+            reject("below_minimum_hour_volume")
+            continue
+        if price <= 0:
+            reject("missing_price")
             continue
         if sniper_max_age_minutes is not None:
             # Only prioritize pools for which the upstream age is known.
@@ -77,20 +92,28 @@ def extract_quality_pool_mints(payload: dict, *, sol_mint: str,
                 created_at = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
                 age_minutes = (datetime.now(timezone.utc) - created_at).total_seconds() / 60.0
             except (TypeError, ValueError, OverflowError):
+                reject("missing_or_invalid_pool_age")
                 continue
-            if age_minutes < sniper_min_age_minutes or age_minutes > sniper_max_age_minutes:
+            if age_minutes < sniper_min_age_minutes:
+                reject("too_new")
+                continue
+            if age_minutes > sniper_max_age_minutes:
+                reject("too_old")
                 continue
             v5m = _number((attr.get("volume_usd") or {}).get("m5"))
             if discovery_stage != "watch" and v5m < (sniper_min_volume_5m_usd or 0):
+                reject("low_5m_volume")
                 continue
             change_5m = attr.get("price_change_percentage") or {}
             try:
                 momentum = float(change_5m.get("m5"))
             except (TypeError, ValueError):
                 if discovery_stage != "watch":
+                    reject("missing_momentum")
                     continue
                 momentum = 0.0
             if discovery_stage != "watch" and (not math.isfinite(momentum) or not (sniper_min_change_5m_pct or 0) <= momentum <= sniper_max_change_5m_pct):
+                reject("momentum_out_of_range")
                 continue
             if not math.isfinite(momentum):
                 momentum = 0.0
@@ -99,6 +122,7 @@ def extract_quality_pool_mints(payload: dict, *, sol_mint: str,
             sells = _number(txns.get("sells"))
             # No inferred activity: require reported buys AND sells for a meaningful ratio.
             if discovery_stage != "watch" and (buys + sells < sniper_min_txns_5m or sells <= 0 or buys / sells < sniper_min_buy_sell_ratio):
+                reject("trade_flow_insufficient")
                 continue
         score = min(liq, 250000.0) + 2.0 * min(v1h, 250000.0)
         if sniper_max_age_minutes is not None:
