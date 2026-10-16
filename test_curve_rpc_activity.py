@@ -107,7 +107,7 @@ def test_rpc_rate_limit_cooldown_and_fails_closed():
     tracker.poll([MINT])
     diag = tracker.diagnostics()
     assert diag['rate_limits'] == 1 and diag['valid_trades'] == 0
-    assert diag['last_error'] == 'getSignaturesForAddress:RpcTradeError'
+    assert diag['last_error'] == 'getSignaturesForAddress:RpcTradeError:code=429'
     tracker.poll([MINT])
     assert tracker.diagnostics()['rate_limits'] == 1
 

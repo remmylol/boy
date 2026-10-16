@@ -203,9 +203,12 @@ class RpcCurveTradeTracker:
         self.cursor: OrderedDict[str, str] = OrderedDict()
         self.pending: OrderedDict[str, tuple[str, int]] = OrderedDict()
         self.seen: OrderedDict[str, None] = OrderedDict()
+        self.retry: dict[str, tuple[int, float]] = {}
         self.stats = {"poll_cycles": 0, "signature_scans": 0, "tx_fetched": 0, "valid_trades": 0,
                       "rpc_errors": 0, "rate_limits": 0, "history_gaps": 0,
-                      "stale_trades": 0, "ignored_events": 0, "successful_scans": 0}
+                      "stale_trades": 0, "ignored_events": 0, "successful_scans": 0,
+                      "tx_retries": 0, "tx_dropped": 0, "tx_null": 0, "tx_error_codes": {},
+                      "ignored_reasons": {}}
         self.last_trade_monotonic = None
         self.last_success_monotonic = None
         self.cooldown_until = 0.
@@ -221,7 +224,13 @@ class RpcCurveTradeTracker:
             if code == 429 or "429" in str(exc):
                 self.stats["rate_limits"] += 1
                 self.cooldown_until = time.monotonic() + 120
-            self.last_error = f"{method}:{type(exc).__name__}"  # no key or URL leaked
+            # Only report numeric RPC codes and controlled labels; never leak endpoint URLs or keys.
+            safe_code = code if isinstance(code, int) else "unknown"
+            self.last_error = f"{method}:{type(exc).__name__}:code={safe_code}"
+            codes = self.stats["tx_error_codes"]
+            if method == "getTransaction":
+                label = str(safe_code)
+                codes[label] = codes.get(label, 0) + 1
             raise
 
     def poll(self, mints: list[str], *, now_wall: float | None = None, now_mono: float | None = None) -> None:
@@ -270,31 +279,58 @@ class RpcCurveTradeTracker:
                         fresh.append((signature, block_time))
                 for signature, block_time in reversed(fresh):
                     if len(self.pending) >= self.max_pending:
-                        self.pending.popitem(last=False)
+                        dropped, _ = self.pending.popitem(last=False)
+                        self.retry.pop(dropped, None)
                         self.stats["history_gaps"] += 1
                     self.pending[signature] = (mint, block_time)
             # After a 429, do not make additional RPC calls during cooldown.
             if mono < self.cooldown_until:
                 return
+            # Newest-first prevents a flood of old pending signatures from
+            # turning otherwise valid five-minute trades into stale observations.
+            # A transient getTransaction error must not stall all other mints.
             tx_budget = self.transaction_limit
-            # Process pending even when no mint was selected this cycle.
-            while tx_budget and self.pending:
-                signature, (mint, block_time) = self.pending.popitem(last=False)
+            for signature in list(reversed(self.pending)):
+                if tx_budget <= 0 or mono < self.cooldown_until:
+                    break
+                mint, block_time = self.pending.get(signature, (None, None))
+                if mint is None:
+                    continue
+                if block_time < wall - self.lookback_seconds or block_time > wall + 30:
+                    self.pending.pop(signature, None)
+                    self.retry.pop(signature, None)
+                    self.stats["stale_trades"] += 1
+                    continue
+                attempts, retry_at = self.retry.get(signature, (0, 0.))
+                if mono < retry_at:
+                    continue
                 tx_budget -= 1
                 try:
                     tx = self._rpc("getTransaction", [signature, {"encoding": "json",
                                   "commitment": "confirmed", "maxSupportedTransactionVersion": 0}])
-                except Exception:
-                    # transient errors: retry on the next pass unless there's
-                    # no remaining queue capacity. No fabricated observations.
-                    self.pending[signature] = (mint, block_time)
-                    self.pending.move_to_end(signature, last=False)
-                    break
+                except Exception as exc:
+                    attempts += 1
+                    if attempts >= 3:
+                        self.pending.pop(signature, None)
+                        self.retry.pop(signature, None)
+                        self.stats["tx_dropped"] += 1
+                        self.stats["history_gaps"] += 1
+                    else:
+                        self.retry[signature] = (attempts, mono + min(90., 10. * (2 ** (attempts - 1))))
+                        self.stats["tx_retries"] += 1
+                    continue
                 if tx is None:
-                    # RPC may not have propagated transaction detail yet.
-                    self.pending[signature] = (mint, block_time)
-                    self.pending.move_to_end(signature, last=False)
-                    break
+                    self.stats["tx_null"] += 1
+                    attempts += 1
+                    if attempts >= 3:
+                        self.pending.pop(signature, None)
+                        self.retry.pop(signature, None)
+                        self.stats["tx_dropped"] += 1
+                    else:
+                        self.retry[signature] = (attempts, mono + min(90., 10. * (2 ** (attempts - 1))))
+                    continue
+                self.pending.pop(signature, None)
+                self.retry.pop(signature, None)
                 self.stats["tx_fetched"] += 1
                 self.seen[signature] = None
                 if len(self.seen) > 2000:
@@ -305,12 +341,13 @@ class RpcCurveTradeTracker:
                 if age > self.lookback_seconds or age < -30:
                     self.stats["stale_trades"] += 1
                     continue
-                # Map wall-clock transaction time to CurveActivity's monotonic
-                # clock so backfilled transactions expire at the correct time.
                 observed_at = mono - max(0., age)
                 events = extract_curve_trades(tx, mint)
                 if not events:
                     self.stats["ignored_events"] += 1
+                    reason = "failed_transaction" if isinstance(tx, dict) and (tx.get("meta") or {}).get("err") is not None else ("missing_pump_program" if isinstance(tx, dict) and PUMP_PROGRAM_ID not in _program_keys(tx) else "no_matching_trade_event")
+                    reasons = self.stats["ignored_reasons"]
+                    reasons[reason] = reasons.get(reason, 0) + 1
                 for event in events:
                     if self.activity.record(event, now=observed_at):
                         self.stats["valid_trades"] += 1
@@ -326,6 +363,7 @@ class RpcCurveTradeTracker:
                         round(time.monotonic() - self.last_success_monotonic, 1))
             return {"source": "solana_rpc", **self.stats,
                     "pending_signatures": len(self.pending),
+                    "retry_waiting": len(self.retry),
                     "tracked_cursors": len(self.cursor),
                     "last_trade_age_seconds": age,
                     "last_successful_scan_age_seconds": scan_age,
