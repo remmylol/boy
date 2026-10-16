@@ -207,8 +207,13 @@ class RpcCurveTradeTracker:
         self.stats = {"poll_cycles": 0, "signature_scans": 0, "tx_fetched": 0, "valid_trades": 0,
                       "rpc_errors": 0, "rate_limits": 0, "history_gaps": 0,
                       "stale_trades": 0, "ignored_events": 0, "successful_scans": 0,
-                      "tx_retries": 0, "tx_dropped": 0, "tx_null": 0, "tx_error_codes": {},
+                      "tx_retries": 0, "tx_dropped": 0, "tx_null": 0,
+                      "backpressure_cycles": 0, "signature_scans_deferred": 0,
+                      "pending_peak": 0, "queue_overflow_drops": 0,
+                      "rpc_gap_signatures": 0, "rpc_gap_overflow": 0,
+                      "tx_error_codes": {},
                       "ignored_reasons": {}}
+        self._scan_cursor = 0
         self.last_trade_monotonic = None
         self.last_success_monotonic = None
         self.cooldown_until = 0.
@@ -240,7 +245,30 @@ class RpcCurveTradeTracker:
             if mono < self.cooldown_until:
                 return
             self.stats["poll_cycles"] += 1
-            for mint in list(dict.fromkeys(mints)):
+            # Drop expired jobs before accepting fresh signatures. Exceeding a
+            # five-minute activity window is a data coverage loss, not a zero.
+            for signature, (_, block_time) in list(self.pending.items()):
+                if block_time < wall - self.lookback_seconds or block_time > wall + 30:
+                    self.pending.pop(signature, None)
+                    self.retry.pop(signature, None)
+                    self.stats["stale_trades"] += 1
+            self.stats["pending_peak"] = max(self.stats["pending_peak"], len(self.pending))
+            unique_mints = list(dict.fromkeys(mints))
+            # Keep ingestion sustainable: no more than ~2x the transaction
+            # processing budget and pause ingestion when queue is saturated.
+            max_scans = max(1, self.transaction_limit * 2 // self.signature_limit)
+            scan_slots = min(len(unique_mints), max_scans)
+            if len(self.pending) >= int(self.max_pending * .75):
+                self.stats["backpressure_cycles"] += 1
+                scan_slots = 0
+            if unique_mints:
+                begin = self._scan_cursor % len(unique_mints)
+                rotated = unique_mints[begin:] + unique_mints[:begin]
+                self._scan_cursor = (begin + scan_slots) % len(unique_mints)
+            else:
+                rotated = []
+            self.stats["signature_scans_deferred"] += len(rotated) - scan_slots
+            for mint in rotated[:scan_slots]:
                 try:
                     addr = self.address_fn(mint)
                     sigs = self._rpc("getSignaturesForAddress", [addr,
@@ -262,6 +290,7 @@ class RpcCurveTradeTracker:
                 returned = [row.get("signature") for row in sigs if isinstance(row, dict)]
                 if prev and prev not in returned and len(sigs) >= self.signature_limit:
                     self.stats["history_gaps"] += 1
+                    self.stats["rpc_gap_signatures"] += 1
                 fresh = []
                 for row in sigs:
                     if not isinstance(row, dict):
@@ -282,7 +311,10 @@ class RpcCurveTradeTracker:
                         dropped, _ = self.pending.popitem(last=False)
                         self.retry.pop(dropped, None)
                         self.stats["history_gaps"] += 1
+                        self.stats["rpc_gap_overflow"] += 1
+                        self.stats["queue_overflow_drops"] += 1
                     self.pending[signature] = (mint, block_time)
+                    self.stats["pending_peak"] = max(self.stats["pending_peak"], len(self.pending))
             # After a 429, do not make additional RPC calls during cooldown.
             if mono < self.cooldown_until:
                 return
