@@ -1,0 +1,51 @@
+2026-10-16 14:29:07,324 INFO PAPER ENTRY METRICS SHADOW discovery_to_entry_s=None fee_haircut_est_pct=4.00
+2026-10-16 14:29:07,324 INFO PAPER BUY SHADOW ($10.00) score=80.0 price=1.02
+2026-10-16 14:29:07,324 ERROR PAPER EXIT UNAVAILABLE SHADOW mint=shadow-mint reason=primary_pool_quote_missing_fallback_valuation_only checks=1; position retained, no sale assumed, new entries halted; rechecking every cycle
+2026-10-16 14:29:07,324 INFO PAPER ENTRY METRICS SHADOW discovery_to_entry_s=None fee_haircut_est_pct=4.00
+2026-10-16 14:29:07,325 INFO PAPER BUY SHADOW ($10.00) score=80.0 price=1.02
+2026-10-16 14:29:07,325 INFO PAPER MILESTONE SHADOW target=30s observed_at=30.0s estimated_net_pct=-3.96
+2026-10-16 14:29:07,325 WARNING PAPER REVERSAL EXIT SIGNAL SHADOW decline=6.00% observations=3 source=dexscreener; checking verified indicative exit
+2026-10-16 14:29:07,325 INFO PAPER SHADOW C SHADOW status=closed_at_actual_exit reason=actual_trade_closed_first net_pct=-9.72 seconds=50 [paper_estimate_only]
+2026-10-16 14:29:07,325 INFO PAPER TRADE METRICS SHADOW entry_delay_s=None mfe_net_pct=-3.9592316738533917 mae_net_pct=-9.719554360353422 hit_tp_observed=False seconds_to_tp=None points={'30': {'elapsed_seconds': 30, 'net_return_pct': -3.959}} round_trip_cost_assumption_pct=4.00 exit_impact_est_pct=0.037
+2026-10-16 14:29:07,325 INFO PAPER SELL SHADOW reason=immediate_reversal PnL=$-0.97 (-9.7%) impact≈0.04% [estimate only]
+2026-10-16 14:29:07,325 INFO PAPER ENTRY METRICS SHADOW discovery_to_entry_s=None fee_haircut_est_pct=4.00
+2026-10-16 14:29:07,325 INFO PAPER BUY SHADOW ($10.00) score=80.0 price=1.02
+2026-10-16 14:29:07,326 INFO PAPER SHADOW C SHADOW reason=take_profit estimated_net_pct=15.24 elapsed_s=30.0 [no simulated fill guarantee]
+2026-10-16 14:29:07,326 INFO PAPER MILESTONE SHADOW target=30s observed_at=30.0s estimated_net_pct=15.24
+2026-10-16 14:29:14,329 INFO PAPER ENTRY METRICS MET discovery_to_entry_s=None fee_haircut_est_pct=4.00
+2026-10-16 14:29:14,329 INFO PAPER BUY MET ($10.00) score=83.0 price=1.02
+2026-10-16 14:29:14,329 ERROR PAPER EXIT UNAVAILABLE MET mint=metrics-mint reason=missing_exit_liquidity checks=1; position retained, no sale assumed, new entries halted; rechecking every cycle
+2026-10-16 14:29:14,329 INFO PAPER ENTRY METRICS MET discovery_to_entry_s=10 fee_haircut_est_pct=4.00
+2026-10-16 14:29:14,329 INFO PAPER BUY MET ($10.00) score=83.0 price=1.02
+2026-10-16 14:29:14,330 INFO PAPER MILESTONE MET target=30s observed_at=35.0s estimated_net_pct=5.64
+2026-10-16 14:29:14,330 INFO PAPER SHADOW C MET status=closed_at_actual_exit reason=actual_trade_closed_first net_pct=5.641 seconds=50 [paper_estimate_only]
+2026-10-16 14:29:14,330 INFO PAPER TRADE METRICS MET entry_delay_s=10 mfe_net_pct=5.6407040100348915 mae_net_pct=5.6407040100348915 hit_tp_observed=False seconds_to_tp=None points={'30': {'elapsed_seconds': 35, 'net_return_pct': 5.641}} round_trip_cost_assumption_pct=4.00 exit_impact_est_pct=0.043
+2026-10-16 14:29:14,330 INFO PAPER SELL MET reason=time_limit PnL=$0.56 (5.6%) impact≈0.04% [estimate only]
+2026-10-16 14:29:14,330 INFO PAPER ENTRY METRICS SHADOW discovery_to_entry_s=None fee_haircut_est_pct=4.00
+2026-10-16 14:29:14,331 INFO PAPER BUY SHADOW ($10.00) score=80.0 price=1.02
+2026-10-16 14:29:14,331 ERROR PAPER EXIT UNAVAILABLE SHADOW mint=shadow-mint reason=primary_pool_quote_missing_fallback_valuation_only checks=1; position retained, no sale assumed, new entries halted; rechecking every cycle
+2026-10-16 14:29:14,331 INFO PAPER ENTRY METRICS SHADOW discovery_to_entry_s=None fee_haircut_est_pct=4.00
+2026-10-16 14:29:14,331 INFO PAPER BUY SHADOW ($10.00) score=80.0 price=1.02
+2026-10-16 14:29:14,332 INFO PAPER MILESTONE SHADOW target=30s observed_at=30.0s estimated_net_pct=-3.96
+2026-10-16 14:29:14,332 WARNING PAPER REVERSAL EXIT SIGNAL SHADOW decline=6.00% observations=3 source=dexscreener; checking verified indicative exit
+2026-10-16 14:29:14,332 INFO PAPER SHADOW C SHADOW status=closed_at_actual_exit reason=actual_trade_closed_first net_pct=-9.72 seconds=50 [paper_estimate_only]
+2026-10-16 14:29:14,332 INFO PAPER TRADE METRICS SHADOW entry_delay_s=None mfe_net_pct=-3.9592316738533917 mae_net_pct=-9.719554360353422 hit_tp_observed=False seconds_to_tp=None points={'30': {'elapsed_seconds': 30, 'net_return_pct': -3.959}} round_trip_cost_assumption_pct=4.00 exit_impact_est_pct=0.037
+2026-10-16 14:29:14,332 INFO PAPER SELL SHADOW reason=immediate_reversal PnL=$-0.97 (-9.7%) impact≈0.04% [estimate only]
+2026-10-16 14:29:14,333 INFO PAPER ENTRY METRICS SHADOW discovery_to_entry_s=None fee_haircut_est_pct=4.00
+2026-10-16 14:29:14,333 INFO PAPER BUY SHADOW ($10.00) score=80.0 price=1.02
+2026-10-16 14:29:14,333 INFO PAPER SHADOW C SHADOW reason=take_profit estimated_net_pct=15.24 elapsed_s=30.0 [no simulated fill guarantee]
+2026-10-16 14:29:14,333 INFO PAPER MILESTONE SHADOW target=30s observed_at=30.0s estimated_net_pct=15.24
+2026-10-16 14:29:39,089 INFO PAPER ENTRY METRICS SHADOW discovery_to_entry_s=None fee_haircut_est_pct=4.00
+2026-10-16 14:29:39,089 INFO PAPER BUY SHADOW ($10.00) score=80.0 price=1.02
+2026-10-16 14:29:39,090 ERROR PAPER EXIT UNAVAILABLE SHADOW mint=shadow-mint reason=primary_pool_quote_missing_fallback_valuation_only checks=1; position retained, no sale assumed, new entries halted; rechecking every cycle
+2026-10-16 14:29:39,090 INFO PAPER ENTRY METRICS SHADOW discovery_to_entry_s=None fee_haircut_est_pct=4.00
+2026-10-16 14:29:39,090 INFO PAPER BUY SHADOW ($10.00) score=80.0 price=1.02
+2026-10-16 14:29:39,090 INFO PAPER MILESTONE SHADOW target=30s observed_at=30.0s estimated_net_pct=-3.96
+2026-10-16 14:29:39,091 WARNING PAPER REVERSAL EXIT SIGNAL SHADOW decline=6.00% observations=3 source=dexscreener; checking verified indicative exit
+2026-10-16 14:29:39,091 INFO PAPER SHADOW C SHADOW status=closed_at_actual_exit reason=actual_trade_closed_first net_pct=-9.72 seconds=50 [paper_estimate_only]
+2026-10-16 14:29:39,091 INFO PAPER TRADE METRICS SHADOW entry_delay_s=None mfe_net_pct=-3.9592316738533917 mae_net_pct=-9.719554360353422 hit_tp_observed=False seconds_to_tp=None points={'30': {'elapsed_seconds': 30, 'net_return_pct': -3.959}} round_trip_cost_assumption_pct=4.00 exit_impact_est_pct=0.037
+2026-10-16 14:29:39,091 INFO PAPER SELL SHADOW reason=immediate_reversal PnL=$-0.97 (-9.7%) impact≈0.04% [estimate only]
+2026-10-16 14:29:39,091 INFO PAPER ENTRY METRICS SHADOW discovery_to_entry_s=None fee_haircut_est_pct=4.00
+2026-10-16 14:29:39,091 INFO PAPER BUY SHADOW ($10.00) score=80.0 price=1.02
+2026-10-16 14:29:39,091 INFO PAPER SHADOW C SHADOW reason=take_profit estimated_net_pct=15.24 elapsed_s=30.0 [no simulated fill guarantee]
+2026-10-16 14:29:39,091 INFO PAPER MILESTONE SHADOW target=30s observed_at=30.0s estimated_net_pct=15.24
