@@ -1,0 +1,1937 @@
+import json
+import re
+import logging
+import os
+import time
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone, date
+from pathlib import Path
+from typing import Any
+from collections import Counter, OrderedDict
+import threading
+from pump_curve_market import lookup_curve
+from curve_paper import buy_quote, sell_quote
+from curve_activity import CurveActivity
+from curve_rpc_activity import RpcCurveTradeTracker, ReadOnlySolanaRPC
+from quality_pool_discovery import extract_quality_pool_mints
+from pumpfun_boards import board_mints, valid_pumpfun_endpoint, MOVERS_URL, TRENDING_PROXY_URL
+from fomo_boards import extract_fomo_mints, inspect_fomo_board, network_distribution, BASE_URL as FOMO_API_BASE_URL
+from live_execution import execute_buy, execute_sell
+print("EXECUTION BRIDGE LOADED - preview only, live trading disabled", flush=True)
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ---- Configuration ----
+STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL_USD", "36"))
+PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "5"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
+POSITION_SIZE_USD = float(os.getenv("POSITION_SIZE_USD", "10"))  # Fixed paper position size in USD
+MAX_DAILY_LOSS_FRACTION = float(os.getenv("MAX_DAILY_LOSS_FRACTION", "0.5"))
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", "0.20"))
+STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", "0.35"))
+TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "false").lower() == "true"
+TRAILING_STOP = float(os.getenv("TRAILING_STOP_PCT", "0.15"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "70"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
+MIN_SOL_PAIR_LIQUIDITY_USD = max(5000.0, float(os.getenv("MIN_SOL_PAIR_LIQUIDITY_USD", "5000")))
+MIN_VOLUME_5M_USD = float(os.getenv("MIN_VOLUME_5M_USD", "1000"))
+MAX_PAIR_AGE_HOURS = float(os.getenv("MAX_PAIR_AGE_HOURS", "0.5"))
+MIN_PAIR_AGE_MINUTES = float(os.getenv("MIN_PAIR_AGE_MINUTES", "1"))
+FAST_MOMENTUM_ENABLED = os.getenv("FAST_MOMENTUM_ENABLED", "true").lower() == "true"
+SNIPER_MODE = os.getenv("SNIPER_MODE", "true").lower() == "true"
+SNIPER_MAX_ENTRY_IMPACT_PCT = float(os.getenv("SNIPER_MAX_ENTRY_IMPACT_PCT", "2"))
+SNIPER_MAX_AGE_MINUTES = float(os.getenv("SNIPER_MAX_AGE_MINUTES", "45"))
+SNIPER_MIN_VOLUME_5M_USD = float(os.getenv("SNIPER_MIN_VOLUME_5M_USD", "3000"))
+SNIPER_MIN_BUY_SELL_RATIO = float(os.getenv("SNIPER_MIN_BUY_SELL_RATIO", "1.2"))
+SNIPER_MIN_PRICE_CHANGE_5M_PCT = float(os.getenv("SNIPER_MIN_PRICE_CHANGE_5M_PCT", "3"))
+SNIPER_MIN_TXNS_5M = int(os.getenv("SNIPER_MIN_TXNS_5M", "10"))
+SNIPER_MAX_PRICE_CHANGE_5M_PCT = float(os.getenv("SNIPER_MAX_PRICE_CHANGE_5M_PCT", "60"))
+MOMENTUM_MIN_VOLUME_5M_USD = float(os.getenv("MOMENTUM_MIN_VOLUME_5M_USD", "5000"))
+MOMENTUM_MIN_CHANGE_5M_PCT = float(os.getenv("MOMENTUM_MIN_CHANGE_5M_PCT", "5"))
+MOMENTUM_MAX_CHANGE_5M_PCT = float(os.getenv("MOMENTUM_MAX_CHANGE_5M_PCT", "80"))
+MOMENTUM_MIN_TXNS_5M = int(os.getenv("MOMENTUM_MIN_TXNS_5M", "12"))
+MOMENTUM_MIN_BUY_SELL_RATIO = float(os.getenv("MOMENTUM_MIN_BUY_SELL_RATIO", "1.3"))
+MOMENTUM_MIN_VOLUME_LIQUIDITY_RATIO = float(os.getenv("MOMENTUM_MIN_VOLUME_LIQUIDITY_RATIO", "0.10"))
+MAX_HOLD_MINUTES = float(os.getenv("MAX_HOLD_MINUTES", "5"))
+# Price-history confirmation uses already observed quotes; no extra paid API calls.
+ENTRY_TREND_CONFIRM_ENABLED = os.getenv("ENTRY_TREND_CONFIRM_ENABLED", "true").lower() == "true"
+ENTRY_TREND_MIN_OBSERVATION_SECONDS = max(5.0, float(os.getenv("ENTRY_TREND_MIN_OBSERVATION_SECONDS", "15")))
+ENTRY_TREND_MAX_OBSERVATION_SECONDS = max(ENTRY_TREND_MIN_OBSERVATION_SECONDS, float(os.getenv("ENTRY_TREND_MAX_OBSERVATION_SECONDS", "120")))
+ENTRY_TREND_MIN_CHANGE_PCT = float(os.getenv("ENTRY_TREND_MIN_CHANGE_PCT", "0.2"))
+ENTRY_TREND_MAX_BUY_PRESSURE_DROP = max(0.0, float(os.getenv("ENTRY_TREND_MAX_BUY_PRESSURE_DROP", "0.03")))
+PAPER_REVERSAL_EXIT_ENABLED = os.getenv("PAPER_REVERSAL_EXIT_ENABLED", "true").lower() == "true"
+PAPER_REVERSAL_MIN_HOLD_SECONDS = max(0.0, float(os.getenv("PAPER_REVERSAL_MIN_HOLD_SECONDS", "20")))
+PAPER_REVERSAL_LOOKBACK_SECONDS = max(10.0, float(os.getenv("PAPER_REVERSAL_LOOKBACK_SECONDS", "45")))
+PAPER_REVERSAL_MIN_DROP_PCT = max(0.1, float(os.getenv("PAPER_REVERSAL_MIN_DROP_PCT", "4")))
+PAPER_REVERSAL_CONFIRM_OBSERVATIONS = max(2, int(os.getenv("PAPER_REVERSAL_CONFIRM_OBSERVATIONS", "3")))
+PAPER_REVERSAL_MAX_QUOTE_AGE_SECONDS = max(5.0, float(os.getenv("PAPER_REVERSAL_MAX_QUOTE_AGE_SECONDS", "20")))
+SHADOW_STRATEGY_C_TP = float(os.getenv("SHADOW_STRATEGY_C_TP", "0.10"))
+SHADOW_STRATEGY_C_SL = float(os.getenv("SHADOW_STRATEGY_C_SL", "0.15"))
+
+MAX_SLIPPAGE_BPS = int(os.getenv("MAX_SLIPPAGE_BPS", "150"))
+MAX_STALE_PRICE_SECONDS = int(os.getenv("MAX_STALE_PRICE_SECONDS", "60"))
+# Fee/slippage haircut used for paper-trade estimates. Actual costs vary.
+ESTIMATED_ROUND_TRIP_COST = float(os.getenv("ESTIMATED_ROUND_TRIP_COST", "0.04"))
+PAPER_MAX_EXIT_IMPACT = float(os.getenv("PAPER_MAX_EXIT_IMPACT", "0.10"))
+PAPER_EXIT_LIQUIDITY_FRACTION = float(os.getenv("PAPER_EXIT_LIQUIDITY_FRACTION", "0.5"))
+PAPER_EXIT_WARNING_INTERVAL_SECONDS = max(30, int(os.getenv("PAPER_EXIT_WARNING_INTERVAL_SECONDS", "60")))
+PAPER_POOL_FALLBACK_SECONDS = max(10, int(os.getenv("PAPER_POOL_FALLBACK_SECONDS", "30")))
+PAPER_IMPAIRED_AFTER_SECONDS = max(30, int(os.getenv("PAPER_IMPAIRED_AFTER_SECONDS", "60")))
+PAPER_IMPAIRED_AFTER_CHECKS = max(2, int(os.getenv("PAPER_IMPAIRED_AFTER_CHECKS", "3")))
+PAPER_PREBUY_SELL_CHECK_ENABLED = os.getenv("PAPER_PREBUY_SELL_CHECK_ENABLED", "true").lower() == "true"
+# Independent, pinned-pool read-only cross-check for new entries (fails closed).
+PAPER_PREBUY_INDEPENDENT_POOL_CHECK = os.getenv("PAPER_PREBUY_INDEPENDENT_POOL_CHECK", "true").lower() == "true"
+PAPER_PREBUY_MIN_CROSSCHECK_LIQUIDITY_RATIO = max(0.1, min(1.0, float(os.getenv("PAPER_PREBUY_MIN_CROSSCHECK_LIQUIDITY_RATIO", "0.70"))))
+PAPER_PREBUY_MAX_CROSSCHECK_PRICE_DEVIATION_PCT = max(0.0, float(os.getenv("PAPER_PREBUY_MAX_CROSSCHECK_PRICE_DEVIATION_PCT", "12")))
+PAPER_EXIT_REQUIRE_PRIMARY_QUOTE = os.getenv("PAPER_EXIT_REQUIRE_PRIMARY_QUOTE", "true").lower() == "true"
+PAPER_FALLBACK_LOG_INTERVAL_SECONDS = max(15, int(os.getenv("PAPER_FALLBACK_LOG_INTERVAL_SECONDS", "60")))
+SNIPER_MIN_ENTRY_LIQUIDITY_MULTIPLIER = max(1.0, float(os.getenv("SNIPER_MIN_ENTRY_LIQUIDITY_MULTIPLIER", "1.5")))
+
+PUMP_CURVE_LOOKUP_ENABLED = os.getenv("PUMP_CURVE_LOOKUP_ENABLED", "true").lower() == "true"
+PUMP_CURVE_LOOKUPS_PER_SCAN = max(0, min(10, int(os.getenv("PUMP_CURVE_LOOKUPS_PER_SCAN", "4"))))
+FRESH_LAUNCH_FEED_ENABLED = os.getenv("FRESH_LAUNCH_FEED_ENABLED", "false").lower() == "true"
+FRESH_LAUNCH_TTL_SECONDS = max(300, int(os.getenv("FRESH_LAUNCH_TTL_SECONDS", "3600")))
+FRESH_LAUNCH_POOL_LIMIT = max(100, int(os.getenv("FRESH_LAUNCH_POOL_LIMIT", "1500")))
+FRESH_LAUNCH_SCAN_QUOTA = max(0, int(os.getenv("FRESH_LAUNCH_SCAN_QUOTA", "24")))
+VERIFIED_DEX_RECHECK_QUOTA = max(0, int(os.getenv("VERIFIED_DEX_RECHECK_QUOTA", "18")))
+VERIFIED_DEX_TTL_SECONDS = max(60, int(os.getenv("VERIFIED_DEX_TTL_SECONDS", "900")))
+STRUCTURAL_REJECT_COOLDOWN_SECONDS = max(60, int(os.getenv("STRUCTURAL_REJECT_COOLDOWN_SECONDS", "300")))
+MISSING_DATA_COOLDOWN_SECONDS = max(30, int(os.getenv("MISSING_DATA_COOLDOWN_SECONDS", "120")))
+QUALITY_POOL_DISCOVERY_ENABLED = os.getenv("QUALITY_POOL_DISCOVERY_ENABLED", "true").lower() == "true"
+QUALITY_POOL_CACHE_SECONDS = max(120, int(os.getenv("QUALITY_POOL_CACHE_SECONDS", "180")))
+QUALITY_POOL_SCAN_QUOTA = max(0, int(os.getenv("QUALITY_POOL_SCAN_QUOTA", "18")))
+# Optional unofficial Pump.fun board sources. Missing auth must not break discovery.
+PUMPFUN_BOARDS_ENABLED = os.getenv("PUMPFUN_BOARDS_ENABLED", "false").lower() == "true"
+PUMPFUN_BOARDS_CACHE_SECONDS = max(60, int(os.getenv("PUMPFUN_BOARDS_CACHE_SECONDS", "60")))
+PUMPFUN_BOARDS_LIMIT = max(1, min(50, int(os.getenv("PUMPFUN_BOARDS_LIMIT", "50"))))
+PUMPFUN_MOVERS_ENABLED = os.getenv("PUMPFUN_MOVERS_ENABLED", "true").lower() == "true"
+PUMPFUN_TRENDING_ENABLED = os.getenv("PUMPFUN_TRENDING_ENABLED", "true").lower() == "true"
+PUMPFUN_BOARD_JWT = os.getenv("PUMPFUN_BOARD_JWT", "").strip()
+PUMPFUN_BOARD_SESSION_ID = os.getenv("PUMPFUN_BOARD_SESSION_ID", "").strip()
+PUMPFUN_BOARD_USER_ID = os.getenv("PUMPFUN_BOARD_USER_ID", "").strip()
+PUMPFUN_BOARD_TIER = os.getenv("PUMPFUN_BOARD_TIER", "1").strip()
+PUMPFUN_TRENDING_ENDPOINT = os.getenv("PUMPFUN_TRENDING_ENDPOINT", TRENDING_PROXY_URL).strip()
+
+# FOMO Family unofficial token boards. A key is required for any request.
+# Both boards cost 250 credits per call. 2 feeds / 2h ~= 180k credits/month;
+# the documented free plan provides 250k credits/month.
+FOMO_BOARDS_ENABLED = os.getenv("FOMO_BOARDS_ENABLED", "true").lower() == "true"
+FOMO_API_KEY = os.getenv("FOMO_API_KEY", "").strip()
+FOMO_GRADUATED_ENABLED = os.getenv("FOMO_GRADUATED_ENABLED", "true").lower() == "true"
+FOMO_TRENDING_ENABLED = os.getenv("FOMO_TRENDING_ENABLED", "true").lower() == "true"
+FOMO_BOARDS_CACHE_SECONDS = max(300, int(os.getenv("FOMO_BOARDS_CACHE_SECONDS", "7200")))
+FOMO_BOARDS_LIMIT = max(1, min(150, int(os.getenv("FOMO_BOARDS_LIMIT", "50"))))
+SNIPER_NEW_POOL_PAGES = max(1, min(5, int(os.getenv("SNIPER_NEW_POOL_PAGES", "5"))))
+SNIPER_TRENDING_POOL_PAGES = max(0, min(3, int(os.getenv("SNIPER_TRENDING_POOL_PAGES", "0"))))
+SNIPER_WATCHLIST_LIMIT = max(20, int(os.getenv("SNIPER_WATCHLIST_LIMIT", "250")))
+SNIPER_WATCHLIST_RECHECK_QUOTA = max(0, int(os.getenv("SNIPER_WATCHLIST_RECHECK_QUOTA", "36")))
+SNIPER_WATCHLIST_TTL_SECONDS = max(60, int(os.getenv("SNIPER_WATCHLIST_TTL_SECONDS", "1800")))
+SNIPER_VERIFIED_RECHECK_QUOTA = max(0, int(os.getenv("SNIPER_VERIFIED_RECHECK_QUOTA", "12")))
+SNIPER_LAUNCH_PROBE_QUOTA = max(0, int(os.getenv("SNIPER_LAUNCH_PROBE_QUOTA", "6")))
+QUALITY_POOL_MIN_VOLUME_1H_USD = max(0.0, float(os.getenv("QUALITY_POOL_MIN_VOLUME_1H_USD", "10000")))
+CURVE_MIN_REAL_SOL_FOR_OBSERVATION = max(0.0, float(os.getenv("CURVE_MIN_REAL_SOL_FOR_OBSERVATION", "1.0")))
+FRESH_RECHECK_BASE_SECONDS = max(60, int(os.getenv("FRESH_RECHECK_BASE_SECONDS", "60")))
+FRESH_RECHECK_MAX_SECONDS = max(FRESH_RECHECK_BASE_SECONDS, int(os.getenv("FRESH_RECHECK_MAX_SECONDS", "300")))
+DISCOVERY_SEARCH_TERMS = tuple(x.strip() for x in os.getenv("DISCOVERY_SEARCH_TERMS", "pump").split(",") if x.strip())
+DISCOVERY_SEARCHES_PER_SCAN = max(0, min(3, int(os.getenv("DISCOVERY_SEARCHES_PER_SCAN", "2"))))
+DISCOVERY_CACHE_SECONDS = max(60, int(os.getenv("DISCOVERY_CACHE_SECONDS", "60")))
+ENTRY_SCAN_INTERVAL_SECONDS = max(15, int(os.getenv("ENTRY_SCAN_INTERVAL_SECONDS", "20")))
+ENTRY_BATCH_SIZE = max(1, min(30, int(os.getenv("ENTRY_BATCH_SIZE", "30"))))
+MAX_ENTRY_TOKENS_PER_SCAN = max(1, int(os.getenv("MAX_ENTRY_TOKENS_PER_SCAN", "60")))
+MARKET_REQUEST_SPACING_SECONDS = max(0.0, float(os.getenv("MARKET_REQUEST_SPACING_SECONDS", "1.5")))
+RATE_LIMIT_COOLDOWN_SECONDS = max(30, int(os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "120")))
+BASE = "https://api.dexscreener.com"
+SOL_MINT = "So11111111111111111111111111111111111111112"
+STATE_FILE = Path(os.getenv("STATE_FILE", "bot_state_36.json"))
+PUBLIC_WALLET_ADDRESS = os.getenv("SOLANA_WALLET_ADDRESS", "").strip()
+SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "").strip()
+LOG_FILE = Path("bot.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE, encoding="utf-8")]
+)
+log = logging.getLogger("meme-bot")
+session = requests.Session()
+session.headers.update({"User-Agent": "SolanaMemeRiskBot/0.1"})
+
+
+@dataclass
+class Position:
+    token: str
+    symbol: str
+    name: str
+    entry_price: float
+    amount_usd: float
+    token_units: float
+    opened_at: float
+    peak_price: float
+    last_price: float
+    score: float
+    last_price_at: float = 0.0
+    entry_pool_address: str = ""
+    entry_pool_dex: str = ""
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+_api_cooldown_until = 0.0
+_last_market_request_at = 0.0
+
+
+class DexRateLimited(RuntimeError):
+    pass
+
+
+def api_cooldown_remaining() -> float:
+    return max(0.0, _api_cooldown_until - time.monotonic())
+
+
+def dex_request(url: str, *, params: dict | None = None, timeout: int = 12) -> Any:
+    """Shared DexScreener budget; a 429 pauses ALL DexScreener calls."""
+    global _api_cooldown_until, _last_market_request_at
+    if api_cooldown_remaining() > 0:
+        raise DexRateLimited(f"cooldown {api_cooldown_remaining():.0f}s")
+    wait = MARKET_REQUEST_SPACING_SECONDS - (time.monotonic() - _last_market_request_at)
+    if wait > 0:
+        time.sleep(wait)
+    _last_market_request_at = time.monotonic()
+    response = session.get(url, params=params, timeout=timeout)
+    if response.status_code == 429:
+        retry_after = response.headers.get("Retry-After", "")
+        try:
+            delay = float(retry_after)
+        except (ValueError, TypeError):
+            delay = RATE_LIMIT_COOLDOWN_SECONDS
+        delay = max(RATE_LIMIT_COOLDOWN_SECONDS, min(delay, 900))
+        _api_cooldown_until = time.monotonic() + delay
+        log.warning("DexScreener HTTP 429: pausing API requests for %.0fs", delay)
+        raise DexRateLimited(f"HTTP 429; cooldown {delay:.0f}s")
+    response.raise_for_status()
+    return response.json()
+
+
+def get_json(url: str, timeout: int = 12) -> Any:
+    return dex_request(url, timeout=timeout)
+
+
+def log_real_wallet_balance() -> None:
+    """Read-only Solana balance; never loads a secret or signs a transaction."""
+    if not PUBLIC_WALLET_ADDRESS or not SOLANA_RPC_URL:
+        log.warning("REAL WALLET: unavailable; set SOLANA_WALLET_ADDRESS (public) and SOLANA_RPC_URL in Railway Variables.")
+        return
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", PUBLIC_WALLET_ADDRESS):
+        log.error("REAL WALLET: invalid public address format; no RPC request made.")
+        return
+    if not SOLANA_RPC_URL.startswith("https://"):
+        log.error("REAL WALLET: SOLANA_RPC_URL must use HTTPS.")
+        return
+    try:
+        response = session.post(SOLANA_RPC_URL, json={
+            "jsonrpc": "2.0", "id": 1, "method": "getBalance",
+            "params": [PUBLIC_WALLET_ADDRESS, {"commitment": "confirmed"}],
+        }, timeout=12)
+        response.raise_for_status()
+        payload = response.json()
+        if "error" in payload:
+            raise ValueError("RPC returned an error")
+        lamports = payload["result"]["value"]
+        if not isinstance(lamports, int) or lamports < 0:
+            raise ValueError("RPC returned invalid balance")
+        sol = lamports / 1_000_000_000
+        try:
+            price_response = session.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": "solana", "vs_currencies": "usd"}, timeout=10)
+            price_response.raise_for_status()
+            usd_price = float(price_response.json()["solana"]["usd"])
+            if usd_price <= 0:
+                raise ValueError("Invalid SOL/USD price")
+            log.info("REAL WALLET (read-only): %.6f SOL (~$%.2f USD); PAPER portfolio is separate.", sol, sol * usd_price)
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            log.warning("REAL WALLET (read-only): %.6f SOL; USD estimate unavailable (price feed error).", sol)
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        log.exception("REAL WALLET: unable to fetch balance; paper trading continues independently.")
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            log.exception("State file is unreadable; refusing to overwrite it.")
+            raise
+    return {
+        "cash_usd": STARTING_CAPITAL,
+        "positions": {},
+        "closed_trades": [],
+        "day": str(date.today()),
+        "day_start_equity": STARTING_CAPITAL,
+        "halted": False,
+        "seen_tokens": [],
+        "exit_issues": {},
+        "paper_trade_metrics": {},
+    }
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(STATE_FILE)
+
+
+_discovery_cache: dict[str, Any] = {"until": 0.0, "addresses": []}
+_discovery_round = 0
+_discovery_seen: set[str] = set()
+_discovery_priority: dict[str, float] = {}
+_quality_pool_mints: list[str] = []
+_quality_cache: dict[str, Any] = {"until": 0.0, "mints": [], "scores": {}}
+_board_cache: dict[str, Any] = {"until": 0.0, "movers": [], "trending": [], "warn_at": 0.0}
+_fomo_cache: dict[str, Any] = {"until": 0.0, "graduated": [], "trending": [], "warn_at": 0.0, "disabled": set()}
+
+# Stage 1: supported, priced and liquid newly-created pools (NO momentum gate).
+# Stage 2: scheduled fresh DexScreener rechecks; analyze_pair applies ALL entry gates.
+_sniper_watchlist: OrderedDict[str, tuple[float, float]] = OrderedDict()
+_sniper_watch_cursor = 0
+
+# PumpPortal's public subscribeNewToken feed is discovery-only. Every mint must
+# still pass DexScreener's SOL-pool, liquidity, age and momentum checks.
+_fresh_launches: OrderedDict[str, float] = OrderedDict()
+# Mint -> (next check monotonic timestamp, attempts, last outcome).
+# Entries are bounded by the feed TTL and pool size.
+_fresh_checks: dict[str, tuple[float, int, str]] = {}
+_fresh_lock = threading.Lock()
+_feed_started = False
+_feed_connected = False
+_feed_messages = 0
+_feed_reconnects = 0
+_curve_activity = CurveActivity()
+_curve_subscriptions: OrderedDict[str, float] = OrderedDict()
+_curve_verified: OrderedDict[str, float] = OrderedDict()
+_curve_sub_lock = threading.Lock()
+_curve_rpc_tracker: RpcCurveTradeTracker | None = None
+_curve_poll_worker_running = False
+_curve_poll_cursor = 0
+# Last validated on-chain curve reserves; diagnostics and prioritization only.
+_curve_real_sol: dict[str, tuple[float, float]] = {}
+CURVE_ACTIVITY_ENABLED = os.getenv("CURVE_ACTIVITY_ENABLED", "true").lower() == "true"
+CURVE_ACTIVITY_MAX_SUBSCRIPTIONS = max(1, min(100, int(os.getenv("CURVE_ACTIVITY_MAX_SUBSCRIPTIONS", "40"))))
+CURVE_ACTIVITY_MIN_TRADES = max(1, int(os.getenv("CURVE_ACTIVITY_MIN_TRADES", "20")))
+CURVE_ACTIVITY_MIN_VOLUME_SOL = max(0., float(os.getenv("CURVE_ACTIVITY_MIN_VOLUME_SOL", "2")))
+RPC_TRADE_POLL_INTERVAL_SECONDS = max(15, int(os.getenv("RPC_TRADE_POLL_INTERVAL_SECONDS", "30")))
+RPC_TRADE_MINTS_PER_POLL = max(1, min(12, int(os.getenv("RPC_TRADE_MINTS_PER_POLL", "4"))))
+RPC_TRADE_SIGNATURE_LIMIT = max(2, min(50, int(os.getenv("RPC_TRADE_SIGNATURE_LIMIT", "12"))))
+RPC_TRADE_TRANSACTIONS_PER_POLL = max(1, min(20, int(os.getenv("RPC_TRADE_TRANSACTIONS_PER_POLL", "5"))))
+
+
+def _curve_poll_mints() -> list[str]:
+    """Prioritize confirmed active curves, while rotating across fresh launches.
+
+    The feed can arrive faster than an affordable RPC polling rate, so the
+    observed 5-minute volume is a *lower bound*, not a complete trade tape.
+    """
+    global _curve_poll_cursor
+    with _curve_sub_lock:
+        threshold = time.monotonic() - 900
+        for mint, when in list(_curve_verified.items()):
+            if when < threshold:
+                del _curve_verified[mint]
+                _curve_real_sol.pop(mint, None)
+        # Prefer recently observed, reserve-backed curves, and rotate the rest.
+        # This only prioritizes read-only trade observations; it never enables entries.
+        verified = sorted(_curve_verified, key=lambda mint: (
+            _curve_real_sol.get(mint, (0.0, 0.0))[0] >= CURVE_MIN_REAL_SOL_FOR_OBSERVATION,
+            _curve_activity.summary(mint)['trades'],
+            _curve_verified[mint]), reverse=True)[:max(1, RPC_TRADE_MINTS_PER_POLL // 2)]
+        others = [mint for mint in _curve_subscriptions if mint not in verified]
+        slots = max(0, RPC_TRADE_MINTS_PER_POLL - len(verified))
+        rotating = []
+        if others and slots:
+            start = _curve_poll_cursor % len(others)
+            rotating = [others[(start + i) % len(others)] for i in range(min(slots, len(others)))]
+            _curve_poll_cursor += len(rotating)
+        return verified + rotating
+
+
+def _curve_rpc_worker() -> None:
+    global _curve_rpc_tracker, _curve_poll_worker_running
+    if not SOLANA_RPC_URL:
+        log.warning("CURVE RPC activity unavailable: SOLANA_RPC_URL not configured")
+        return
+    try:
+        tracker = RpcCurveTradeTracker(ReadOnlySolanaRPC(SOLANA_RPC_URL), _curve_activity,
+                                       signature_limit=RPC_TRADE_SIGNATURE_LIMIT,
+                                       transaction_limit=RPC_TRADE_TRANSACTIONS_PER_POLL)
+    except ValueError as exc:
+        log.warning("CURVE RPC activity unavailable: %s", type(exc).__name__)
+        return
+    _curve_rpc_tracker = tracker
+    _curve_poll_worker_running = True
+    log.info("CURVE RPC ACTIVITY started (read-only Solana RPC; no paid trade subscription) poll=%ds mints=%d tx_limit=%d",
+             RPC_TRADE_POLL_INTERVAL_SECONDS, RPC_TRADE_MINTS_PER_POLL,
+             RPC_TRADE_TRANSACTIONS_PER_POLL)
+    try:
+        while True:
+            started = time.monotonic()
+            mints = _curve_poll_mints()
+            try:
+                tracker.poll(mints)
+            except Exception as exc:
+                log.warning("CURVE RPC ACTIVITY worker error=%s", type(exc).__name__)
+            diag = tracker.diagnostics()
+            if mints and (diag['poll_cycles'] <= 3 or diag['poll_cycles'] % 5 == 0):
+                log.info("CURVE RPC ACTIVITY watched=%d polled=%d signature_scans=%d tx_fetched=%d valid_trades=%d rpc_errors=%d history_gaps=%d pending=%d",
+                         len(_curve_subscriptions), len(mints), diag['signature_scans'],
+                         diag['tx_fetched'], diag['valid_trades'], diag['rpc_errors'],
+                         diag['history_gaps'], diag['pending_signatures'])
+            time.sleep(max(1, RPC_TRADE_POLL_INTERVAL_SECONDS - (time.monotonic() - started)))
+    finally:
+        _curve_poll_worker_running = False
+
+
+def start_curve_activity() -> None:
+    if CURVE_ACTIVITY_ENABLED:
+        threading.Thread(target=_curve_rpc_worker, daemon=True, name="curve-rpc-activity").start()
+
+
+def update_curve_subscriptions(mints: list[str]) -> None:
+    """Keep a bounded launch watchlist for read-only RPC polling.
+
+    This no longer sends any paid PumpPortal subscribeTokenTrade requests.
+    """
+    if not CURVE_ACTIVITY_ENABLED:
+        return
+    now = time.monotonic()
+    with _curve_sub_lock:
+        for mint in mints:
+            if not isinstance(mint, str) or not _MINT_RE.fullmatch(mint):
+                continue
+            if mint not in _curve_subscriptions:
+                _curve_subscriptions[mint] = now
+        cutoff = now - min(FRESH_LAUNCH_TTL_SECONDS, 1800)
+        for mint, timestamp in list(_curve_subscriptions.items()):
+            if timestamp < cutoff:
+                del _curve_subscriptions[mint]
+        while len(_curve_subscriptions) > CURVE_ACTIVITY_MAX_SUBSCRIPTIONS:
+            _curve_subscriptions.popitem(last=False)
+
+
+def note_active_curve(mint: str, real_sol: float | None = None) -> None:
+    """Prioritize mints with verified curve accounts for RPC activity polls."""
+    if not CURVE_ACTIVITY_ENABLED:
+        return
+    with _curve_sub_lock:
+        timestamp = time.monotonic()
+        _curve_verified[mint] = timestamp
+        if real_sol is not None:
+            _curve_real_sol[mint] = (max(0.0, real_sol), timestamp)
+        _curve_verified.move_to_end(mint)
+        while len(_curve_verified) > 20:
+            old, _ = _curve_verified.popitem(last=False)
+            _curve_real_sol.pop(old, None)
+
+
+def curve_activity_diagnostics() -> dict[str, Any]:
+    with _curve_sub_lock:
+        watched = len(_curve_subscriptions)
+        verified = len(_curve_verified)
+    tracker = _curve_rpc_tracker
+    details = tracker.diagnostics() if tracker else {"source": "solana_rpc", "valid_trades": 0,
+                                                     "signature_scans": 0, "tx_fetched": 0}
+    return {"watched": watched, "verified_curves": verified, "worker_running": _curve_poll_worker_running,
+            **details}
+
+_MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+
+
+def record_fresh_launch(mint: str, *, seen_at: float | None = None) -> bool:
+    if not isinstance(mint, str) or not _MINT_RE.fullmatch(mint) or mint == SOL_MINT:
+        return False
+    timestamp = time.monotonic() if seen_at is None else seen_at
+    with _fresh_lock:
+        _fresh_launches.pop(mint, None)
+        _fresh_launches[mint] = timestamp
+        _fresh_checks.setdefault(mint, (timestamp, 0, "new"))
+        while len(_fresh_launches) > FRESH_LAUNCH_POOL_LIMIT:
+            old_mint, _ = _fresh_launches.popitem(last=False)
+            _fresh_checks.pop(old_mint, None)
+    update_curve_subscriptions([mint])
+    return True
+
+
+def fresh_launch_snapshot() -> list[str]:
+    cutoff = time.monotonic() - FRESH_LAUNCH_TTL_SECONDS
+    with _fresh_lock:
+        for mint, timestamp in list(_fresh_launches.items()):
+            if timestamp < cutoff:
+                _fresh_launches.pop(mint, None)
+                _fresh_checks.pop(mint, None)
+        return list(reversed(_fresh_launches))
+
+
+
+def due_fresh_launches(*, now: float | None = None, limit: int | None = None) -> list[str]:
+    """Oldest-due first: avoid permanently starving launches behind newer ones."""
+    current = time.monotonic() if now is None else now
+    with _fresh_lock:
+        due = [(checks[0], _fresh_launches[mint], mint)
+               for mint, checks in _fresh_checks.items()
+               if mint in _fresh_launches and checks[0] <= current]
+    due.sort()
+    return [mint for _, _, mint in due[:limit]]
+
+
+def mark_fresh_checked(mint: str, outcome: str, *, now: float | None = None) -> None:
+    current = time.monotonic() if now is None else now
+    with _fresh_lock:
+        if mint not in _fresh_launches:
+            return
+        _, attempts, _ = _fresh_checks.get(mint, (current, 0, "new"))
+        attempts += 1
+        # Missing market data is rechecked regularly as the token matures.
+        # Longer intervals prevent hammering DexScreener for unindexed launches.
+        delay = min(FRESH_RECHECK_MAX_SECONDS, FRESH_RECHECK_BASE_SECONDS * (2 ** min(attempts - 1, 8)))
+        _fresh_checks[mint] = (current + delay, attempts, outcome)
+
+
+def fresh_check_counts() -> dict[str, int]:
+    with _fresh_lock:
+        counts = Counter(outcome for _, _, outcome in _fresh_checks.values())
+    return dict(counts)
+
+
+def _fresh_launch_worker() -> None:
+    global _feed_connected, _feed_messages, _feed_reconnects
+    try:
+        import websocket
+    except ImportError:
+        log.warning("Fresh-launch feed unavailable: install websocket-client")
+        return
+    backoff = 3
+    while True:
+        ws = None
+        try:
+            ws = websocket.create_connection("wss://pumpportal.fun/api/data", timeout=20)
+            ws.settimeout(30)
+            ws.send(json.dumps({"method": "subscribeNewToken"}))
+            _feed_connected = True
+            log.info("FRESH FEED connected (PumpPortal new-token stream)")
+            backoff = 3
+            while True:
+                message = json.loads(ws.recv())
+                if not isinstance(message, dict):
+                    continue
+                mint = message.get("mint")
+                if record_fresh_launch(mint):
+                    _feed_messages += 1
+        except Exception as exc:
+            _feed_reconnects += 1
+            log.warning("FRESH FEED disconnected (%s); retry in %ds", exc, backoff)
+        finally:
+            _feed_connected = False
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+        time.sleep(backoff)
+        backoff = min(60, backoff * 2)
+
+
+def start_fresh_launch_feed() -> None:
+    global _feed_started
+    if not FRESH_LAUNCH_FEED_ENABLED or _feed_started:
+        return
+    _feed_started = True
+    threading.Thread(target=_fresh_launch_worker, daemon=True, name="fresh-launch-feed").start()
+
+
+
+def quality_pool_candidates() -> tuple[list[str], dict[str, float]]:
+    """Public GeckoTerminal discovery: independently reverified on DexScreener.
+
+    Two requests per cache interval, not per 5-second position tick. The source
+    supplies hints, NEVER execution prices, route approvals, or entry decisions.
+    """
+    now = time.monotonic()
+    if not QUALITY_POOL_DISCOVERY_ENABLED:
+        return [], {}
+    if now < _quality_cache["until"]:
+        return list(_quality_cache["mints"]), dict(_quality_cache["scores"])
+    scores: dict[str, float] = {}
+    accepted = 0
+    errors = 0
+    # New pools are the main sniper source; trending is a secondary source.
+    # Public GeckoTerminal is cached ~1 minute and limited to ~10 calls/minute.
+    endpoints = [("new_pools", page) for page in range(1, SNIPER_NEW_POOL_PAGES + 1)] + [("trending_pools", page) for page in range(1, SNIPER_TRENDING_POOL_PAGES + 1)] if SNIPER_MODE else [("trending_pools", 1), ("new_pools", 1)]
+    for endpoint, page in endpoints:
+        try:
+            response = session.get(
+                f"https://api.geckoterminal.com/api/v2/networks/solana/{endpoint}",
+                params={"include": "base_token,quote_token", "page": page},
+                headers={"Accept": "application/json;version=20230203"}, timeout=12)
+            response.raise_for_status()
+            candidates = extract_quality_pool_mints(response.json(),
+                sol_mint=SOL_MINT,
+                supported_dexes=frozenset(SUPPORTED_SOL_ROUTES),
+                min_liquidity_usd=MIN_SOL_PAIR_LIQUIDITY_USD,
+                min_volume_1h_usd=(0.0 if SNIPER_MODE else QUALITY_POOL_MIN_VOLUME_1H_USD),
+                sniper_max_age_minutes=(SNIPER_MAX_AGE_MINUTES if SNIPER_MODE else None),
+                sniper_min_volume_5m_usd=(SNIPER_MIN_VOLUME_5M_USD if SNIPER_MODE else None),
+                sniper_min_change_5m_pct=(SNIPER_MIN_PRICE_CHANGE_5M_PCT if SNIPER_MODE else None),
+                sniper_min_buy_sell_ratio=SNIPER_MIN_BUY_SELL_RATIO,
+                sniper_min_txns_5m=SNIPER_MIN_TXNS_5M,
+                sniper_max_change_5m_pct=SNIPER_MAX_PRICE_CHANGE_5M_PCT,
+                sniper_min_age_minutes=MIN_PAIR_AGE_MINUTES,
+                discovery_stage=("watch" if SNIPER_MODE else "strict"))
+            accepted += len(candidates)
+            for mint, score in candidates.items():
+                scores[mint] = max(scores.get(mint, 0), score)
+        except Exception as exc:
+            errors += 1
+            log.warning("QUALITY POOLS source=%s page=%d failed: %s", endpoint, page, type(exc).__name__)
+    # Preserve previous healthy sample during transient upstream failures.
+    if not scores and errors:
+        scores = dict(_quality_cache["scores"])
+    ordered = sorted(scores, key=scores.get, reverse=True)[:SNIPER_WATCHLIST_LIMIT if SNIPER_MODE else 200]
+    _quality_cache.update(until=now + QUALITY_POOL_CACHE_SECONDS,
+                          mints=ordered, scores={m: scores[m] for m in ordered})
+    log.info("SNIPER POOLS stage1_discovered=%d stage1_unique=%d pages=%d errors=%d", accepted, len(ordered), len(endpoints), errors) if SNIPER_MODE else log.info("QUALITY POOLS discovered=%d unique=%d errors=%d", accepted, len(ordered), errors)
+    return ordered, dict(_quality_cache["scores"])
+
+
+def pumpfun_board_candidates() -> dict[str, list[str]]:
+    """Collect board mint hints once per minute; allow complete failure without stalling scans.
+
+    Pump.fun UI boards are undocumented. Movers requires credentials; trending
+    uses a configurable top-runners proxy, not a guaranteed UI mirror.
+    """
+    if not PUMPFUN_BOARDS_ENABLED:
+        return {"movers": [], "trending": []}
+    stamp = time.monotonic()
+    if stamp < _board_cache["until"]:
+        return {k: list(_board_cache[k]) for k in ("movers", "trending")}
+    result = {"movers": [], "trending": []}
+    auth = {"Authorization": f"Bearer {PUMPFUN_BOARD_JWT}"} if PUMPFUN_BOARD_JWT else {}
+    requests_to_make = []
+    if PUMPFUN_MOVERS_ENABLED and PUMPFUN_BOARD_JWT and PUMPFUN_BOARD_SESSION_ID and PUMPFUN_BOARD_USER_ID:
+        requests_to_make.append(("movers", MOVERS_URL, {"limit": PUMPFUN_BOARDS_LIMIT, "session_id": PUMPFUN_BOARD_SESSION_ID, "tier": PUMPFUN_BOARD_TIER, "userId": PUMPFUN_BOARD_USER_ID}))
+    if PUMPFUN_TRENDING_ENABLED:
+        requests_to_make.append(("trending", PUMPFUN_TRENDING_ENDPOINT, {"limit": PUMPFUN_BOARDS_LIMIT}))
+    failures = []
+    for name, url, params in requests_to_make:
+        if not valid_pumpfun_endpoint(url):
+            failures.append(f"{name}:invalid_endpoint")
+            continue
+        try:
+            response = session.get(url, params=params, headers={"Accept": "application/json", **auth}, timeout=8)
+            response.raise_for_status()
+            result[name] = board_mints(response.json(), limit=PUMPFUN_BOARDS_LIMIT)
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            failures.append(f"{name}:{type(exc).__name__}")
+    _board_cache.update(until=stamp + PUMPFUN_BOARDS_CACHE_SECONDS, **result)
+    # Avoid producing 502/403 warning spam every minute. No credentials logged.
+    if failures and stamp >= _board_cache["warn_at"]:
+        log.warning("PUMPFUN BOARDS unavailable=%s; discovery continues with GeckoTerminal and fresh launch feed", ",".join(failures))
+        _board_cache["warn_at"] = stamp + 600
+    log.info("PUMPFUN BOARDS movers=%d trending_proxy=%d auth_movers=%s interval=%ds",
+             len(result["movers"]), len(result["trending"]), bool(PUMPFUN_BOARD_JWT and PUMPFUN_BOARD_SESSION_ID and PUMPFUN_BOARD_USER_ID), PUMPFUN_BOARDS_CACHE_SECONDS)
+    return result
+
+
+def fomo_board_candidates() -> dict[str, list[str]]:
+    """Fetch FOMO graduated/trending hints at a credit-conscious interval.
+
+    Missing credentials, stale/unavailable boards, exhausted credits and HTTP
+    failures NEVER authorize entries or prevent other discovery sources.
+    Auth/quota failures disable the affected board until process restart.
+    """
+    empty = {"graduated": [], "trending": []}
+    if not FOMO_BOARDS_ENABLED or not FOMO_API_KEY:
+        return empty
+    stamp = time.monotonic()
+    if stamp < _fomo_cache["until"]:
+        return {key: list(_fomo_cache[key]) for key in empty}
+    results = {key: [] for key in empty}
+    errors = []
+    for board, enabled in (("graduated", FOMO_GRADUATED_ENABLED), ("trending", FOMO_TRENDING_ENABLED)):
+        if not enabled or board in _fomo_cache["disabled"]:
+            continue
+        try:
+            response = session.get(
+                f"{FOMO_API_BASE_URL}/v2/leaderboard/tokens/{board}",
+                params={"limit": FOMO_BOARDS_LIMIT},
+                headers={"Authorization": f"Bearer {FOMO_API_KEY}", "Accept": "application/json"},
+                timeout=10,
+            )
+            if response.status_code in (401, 402, 403, 404):
+                _fomo_cache["disabled"].add(board)
+                errors.append(f"{board}:HTTP{response.status_code}:disabled")
+                log.warning("FOMO BOARD DIAGNOSTICS board=%s status=HTTP%d disabled=True", board, response.status_code)
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("available") is False:
+                errors.append(f"{board}:unavailable")
+                log.warning("FOMO BOARD DIAGNOSTICS board=%s status=unavailable_or_invalid_root", board)
+                continue
+            if payload.get("stale") is True or payload.get("source") == "captured":
+                errors.append(f"{board}:stale_or_captured")
+                stale_chains = network_distribution(payload)
+                log.warning("FOMO NETWORKS board=%s solana=%d other=%d unknown=%d excluded=stale_or_captured",
+                            board, stale_chains["solana"], stale_chains["other"], stale_chains["unknown"])
+                log.warning("FOMO BOARD DIAGNOSTICS board=%s status=stale_or_captured source=%s age_hours=%s capture_present=%s",
+                            board, "captured" if payload.get("source") == "captured" else "other",
+                            str(payload.get("ageHours"))[:16] if isinstance(payload.get("ageHours"), (int, float)) else "unknown",
+                            isinstance(payload.get("capturedAt"), str))
+                continue
+            results[board], diagnostics = inspect_fomo_board(payload, limit=FOMO_BOARDS_LIMIT)
+            chain_counts = network_distribution(payload)
+            log.info("FOMO NETWORKS board=%s solana=%d other=%d unknown=%d", board,
+                     chain_counts["solana"], chain_counts["other"], chain_counts["unknown"])
+            log.info("FOMO BOARD DIAGNOSTICS board=%s status=%s records=%d solana_rows=%d valid_mints=%d non_solana=%d missing_network=%d missing_address=%d invalid_address=%d duplicates=%d malformed_rows=%d",
+                     board, diagnostics["status"], diagnostics["records"], diagnostics["solana_rows"],
+                     diagnostics["valid_mints"], diagnostics["non_solana"], diagnostics["missing_network"],
+                     diagnostics["missing_address"], diagnostics["invalid_address"], diagnostics["duplicates"],
+                     diagnostics["malformed_rows"])
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            errors.append(f"{board}:{type(exc).__name__}")
+            log.warning("FOMO BOARD DIAGNOSTICS board=%s status=%s", board, type(exc).__name__)
+    _fomo_cache.update(until=stamp + FOMO_BOARDS_CACHE_SECONDS, **results)
+    if errors and stamp >= _fomo_cache["warn_at"]:
+        log.warning("FOMO BOARDS unavailable=%s; GeckoTerminal discovery continues", ",".join(errors))
+        _fomo_cache["warn_at"] = stamp + 1800
+    log.info("FOMO BOARDS graduated=%d trending=%d enabled=%s interval=%ds",
+             len(results["graduated"]), len(results["trending"]), bool(FOMO_API_KEY), FOMO_BOARDS_CACHE_SECONDS)
+    return results
+
+
+def latest_candidate_addresses() -> list[str]:
+    """Discover Solana mints from profiles, boosts and rotating DEX search queries.
+
+    Discovery data is cached briefly to avoid hammering public APIs every five seconds.
+    Pair quotes are still refreshed on each scan. Search results are *not* trusted
+    as executable routes: entry_pair_reason validates the actual SOL pool.
+    """
+    global _discovery_round
+    now = time.monotonic()
+    if now < _discovery_cache["until"]:
+        return list(_discovery_cache["addresses"])
+
+    addresses: list[str] = []
+    priority: dict[str, float] = {}
+    sources: dict[str, int] = {}
+    endpoints = [
+        f"{BASE}/token-profiles/latest/v1",
+        f"{BASE}/token-boosts/latest/v1",
+        f"{BASE}/token-boosts/top/v1",
+    ]
+    for url in endpoints:
+        try:
+            data = get_json(url)
+            matches = [item["tokenAddress"] for item in data
+                       if isinstance(item, dict) and item.get("chainId") == "solana"
+                       and item.get("tokenAddress")] if isinstance(data, list) else []
+            addresses.extend(mint for mint in matches if mint != SOL_MINT)
+            sources[url.rsplit('/', 3)[-3]] = len(matches)
+        except DexRateLimited:
+            break
+        except Exception as exc:
+            log.warning("Discovery endpoint failed (%s): %s", url, exc)
+
+    if DISCOVERY_SEARCH_TERMS:
+        for offset in range(min(DISCOVERY_SEARCHES_PER_SCAN, len(DISCOVERY_SEARCH_TERMS))):
+            term = DISCOVERY_SEARCH_TERMS[(_discovery_round + offset) % len(DISCOVERY_SEARCH_TERMS)]
+            try:
+                pairs = dex_request(f"{BASE}/latest/dex/search", params={"q": term}).get("pairs") or []
+                matches = []
+                for pair in pairs:
+                    if not isinstance(pair, dict) or pair.get("chainId") != "solana":
+                        continue
+                    mint = (pair.get("baseToken") or {}).get("address")
+                    # Search returns unrelated symbols, SOL/USDC pools, and repeated
+                    # pairs. Only use search hits with a supported SOL route.
+                    if not mint or mint == SOL_MINT:
+                        continue
+                    if (pair.get("quoteToken") or {}).get("address") != SOL_MINT:
+                        continue
+                    if (pair.get("dexId") or "").lower() not in SUPPORTED_SOL_ROUTES:
+                        continue
+                    matches.append(mint)
+                    liquidity = as_float((pair.get("liquidity") or {}).get("usd"))
+                    if liquidity >= MIN_SOL_PAIR_LIQUIDITY_USD:
+                        priority[mint] = max(priority.get(mint, 0), liquidity)
+                addresses.extend(matches)
+                sources[f"search:{term}"] = len(set(matches))
+            except DexRateLimited:
+                break
+            except Exception as exc:
+                log.warning("Discovery search failed (%s): %s", term, exc)
+        _discovery_round = (_discovery_round + DISCOVERY_SEARCHES_PER_SCAN) % len(DISCOVERY_SEARCH_TERMS)
+
+    fomo_results = fomo_board_candidates()
+    fomo_mints = list(dict.fromkeys(fomo_results["graduated"] + fomo_results["trending"]))
+    if SNIPER_MODE:
+        update_sniper_watchlist({mint: 1.0 for mint in fomo_mints})
+    sources["fomo_graduated"] = len(fomo_results["graduated"])
+    sources["fomo_trending"] = len(fomo_results["trending"])
+
+    board_results = pumpfun_board_candidates()
+    board_mint_list = list(dict.fromkeys(board_results["movers"] + board_results["trending"]))
+    # Board rankings only influence what to inspect, not what is eligible.
+    # Stage 2 independently validates SOL pool, age, momentum and sellability.
+    if SNIPER_MODE:
+        update_sniper_watchlist({mint: 1.0 for mint in board_mint_list})
+    sources["pumpfun_movers"] = len(board_results["movers"])
+    sources["pumpfun_trending_proxy"] = len(board_results["trending"])
+
+    quality_mints, quality_scores = quality_pool_candidates()
+    _quality_pool_mints[:] = quality_mints
+    if SNIPER_MODE:
+        update_sniper_watchlist(quality_scores)
+    for mint, score in quality_scores.items():
+        priority[mint] = max(priority.get(mint, 0.0), score)
+    sources["quality_pools"] = len(quality_mints)
+
+    # Feed mints are added even when DexScreener profiles/boosts are unchanged.
+    # A newly launched token may have no indexed SOL pair yet; that is normal.
+    stream_mints = fresh_launch_snapshot()
+    sources["fresh_launch_feed"] = len(stream_mints)
+    unique = [mint for mint in dict.fromkeys(quality_mints + fomo_mints + board_mint_list + stream_mints + addresses) if mint != SOL_MINT]
+    # Preserve rotating coverage of all addresses; prioritize known viable search
+    # hits, but do not permanently starve the remainder of the pool.
+    _discovery_priority.clear()
+    _discovery_priority.update(priority)
+    fresh = sum(mint not in _discovery_seen for mint in unique)
+    _discovery_seen.update(unique)
+    log.info("DISCOVERY sources=%s raw=%d unique=%d new_since_start=%d supported_liquid_search_mints=%d", sources, len(addresses), len(unique), fresh, len(priority))
+    # Keep the last successful token list during rate limits or temporary outages.
+    if unique:
+        _discovery_cache.update(until=time.monotonic() + DISCOVERY_CACHE_SECONDS, addresses=unique)
+        return unique
+    _discovery_cache["until"] = time.monotonic() + DISCOVERY_CACHE_SECONDS
+    return list(_discovery_cache["addresses"])
+
+
+def token_pairs(address: str) -> list[dict]:
+    try:
+        data = get_json(f"{BASE}/token-pairs/v1/solana/{address}")
+        return data if isinstance(data, list) else []
+    except DexRateLimited:
+        return []
+    except Exception as exc:
+        log.debug("Pair lookup failed for %s: %s", address, exc)
+        return []
+
+
+def as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def age_hours(pair: dict) -> float:
+    created = pair.get("pairCreatedAt")
+    if not created:
+        return 1e9
+    return max(0.0, (time.time() * 1000 - float(created)) / 3_600_000)
+
+
+def best_pair(pairs: list[dict]) -> dict | None:
+    # Pick the pair with the deepest liquidity, not necessarily the highest FDV.
+    sol_pairs = [p for p in pairs if p.get("chainId") == "solana" and p.get("priceUsd")]
+    if not sol_pairs:
+        return None
+    return max(sol_pairs, key=lambda p: as_float((p.get("liquidity") or {}).get("usd")))
+
+
+# Entry eligibility is distinct from price discovery for held positions.
+# Only these pool identifiers have an explicit PumpPortal route in our staging flow.
+SUPPORTED_SOL_ROUTES = {"pumpfun": "pump", "pumpswap": "pump-amm"}
+
+
+def entry_pair_reason(pair: dict) -> str | None:
+    if pair.get("chainId") != "solana":
+        return "not a Solana pair"
+    quote = pair.get("quoteToken") or {}
+    if quote.get("address") != SOL_MINT:
+        return f"unsupported quote mint {quote.get('symbol') or quote.get('address') or 'unknown'}"
+    dex = (pair.get("dexId") or "").lower()
+    if dex not in SUPPORTED_SOL_ROUTES:
+        return f"unsupported PumpPortal route {dex or 'unknown'}"
+    liq = as_float((pair.get("liquidity") or {}).get("usd"))
+    if liq < MIN_SOL_PAIR_LIQUIDITY_USD:
+        return f"SOL-pair liquidity ${liq:.0f} below ${MIN_SOL_PAIR_LIQUIDITY_USD:.0f}"
+    return None
+
+
+def entry_pair_diagnostic(pairs: list[dict]) -> tuple[str, dict | None]:
+    """Report the actual blocking stage, without treating absent liquidity as zero.
+
+    A token may have a liquid USDC/Raydium pool and an unindexed Pump.fun
+    bonding curve. Reporting the deepest unrelated pool as a SOL liquidity
+    failure obscures that distinction.
+    """
+    solana = [p for p in pairs if p.get("chainId") == "solana"]
+    sol_quoted = [p for p in solana if (p.get("quoteToken") or {}).get("address") == SOL_MINT]
+    supported = [p for p in sol_quoted if (p.get("dexId") or "").lower() in SUPPORTED_SOL_ROUTES]
+    priced = [p for p in supported if as_float(p.get("priceUsd")) > 0]
+    if not solana:
+        return "no_solana_pair", None
+    if not sol_quoted:
+        return "no_sol_quoted_pair", max(solana, key=lambda p: as_float((p.get("liquidity") or {}).get("usd")))
+    if not supported:
+        return "unsupported_sol_route", max(sol_quoted, key=lambda p: as_float((p.get("liquidity") or {}).get("usd")))
+    if not priced:
+        return "supported_pair_missing_price", supported[0]
+    with_liquidity = [p for p in priced if (p.get("liquidity") or {}).get("usd") is not None]
+    if not with_liquidity:
+        return "supported_pair_liquidity_unavailable", priced[0]
+    deepest = max(with_liquidity, key=lambda p: as_float((p.get("liquidity") or {}).get("usd")))
+    if as_float((deepest.get("liquidity") or {}).get("usd")) < MIN_SOL_PAIR_LIQUIDITY_USD:
+        return "supported_pair_low_liquidity", deepest
+    return "eligible_route_liquidity", deepest
+
+
+def best_entry_pair(pairs: list[dict]) -> dict | None:
+    eligible = [p for p in pairs if entry_pair_reason(p) is None and p.get("priceUsd")]
+    return max(eligible, key=lambda p: as_float((p.get("liquidity") or {}).get("usd")), default=None)
+
+
+def analyze_pair(pair: dict, reject_reasons: Counter | None = None) -> dict | None:
+    token = pair.get("baseToken") or {}
+    address = token.get("address")
+    price = as_float(pair.get("priceUsd"))
+    liquidity = as_float((pair.get("liquidity") or {}).get("usd"))
+    volume = pair.get("volume") or {}
+    txns = pair.get("txns") or {}
+    change = pair.get("priceChange") or {}
+    m5_volume = as_float(volume.get("m5"))
+    h1_volume = as_float(volume.get("h1"))
+    h24_volume = as_float(volume.get("h24"))
+    m5_buys = as_float((txns.get("m5") or {}).get("buys"))
+    m5_sells = as_float((txns.get("m5") or {}).get("sells"))
+    ch5 = as_float(change.get("m5"))
+    ch1 = as_float(change.get("h1"))
+    age = age_hours(pair)
+
+    def reject(reason: str) -> None:
+        if reject_reasons is not None:
+            reject_reasons[reason] += 1
+
+    if not address or price <= 0:
+        reject("missing_price_or_mint")
+        return None
+    if SNIPER_MODE and entry_pair_reason(pair) is not None:
+        reject("sniper_unsupported_or_illiquid_pair")
+        return None
+
+    # Hard safety/liquidity filters. Public DEX data is not a honeypot audit.
+    if liquidity < MIN_LIQUIDITY_USD:
+        reject("minimum_liquidity")
+        return None
+    if m5_volume < MIN_VOLUME_5M_USD:
+        reject("minimum_volume")
+        return None
+    if age > (SNIPER_MAX_AGE_MINUTES / 60 if SNIPER_MODE else MAX_PAIR_AGE_HOURS):
+        reject("too_old")
+        return None
+    if FAST_MOMENTUM_ENABLED or SNIPER_MODE:
+        if age * 60 < MIN_PAIR_AGE_MINUTES:
+            reject("too_new")
+            return None
+        if m5_volume < (SNIPER_MIN_VOLUME_5M_USD if SNIPER_MODE else MOMENTUM_MIN_VOLUME_5M_USD):
+            reject("momentum_volume")
+            return None
+        if not (SNIPER_MIN_PRICE_CHANGE_5M_PCT if SNIPER_MODE else MOMENTUM_MIN_CHANGE_5M_PCT) <= ch5 <= (SNIPER_MAX_PRICE_CHANGE_5M_PCT if SNIPER_MODE else MOMENTUM_MAX_CHANGE_5M_PCT):
+            reject("momentum_price_change")
+            return None
+        if m5_buys + m5_sells < (SNIPER_MIN_TXNS_5M if SNIPER_MODE else MOMENTUM_MIN_TXNS_5M):
+            reject("momentum_transactions")
+            return None
+        if m5_sells <= 0 or m5_buys / m5_sells < (SNIPER_MIN_BUY_SELL_RATIO if SNIPER_MODE else MOMENTUM_MIN_BUY_SELL_RATIO):
+            reject("momentum_buy_sell_ratio")
+            return None
+        if m5_volume / max(liquidity, 1) < MOMENTUM_MIN_VOLUME_LIQUIDITY_RATIO:
+            reject("momentum_volume_liquidity_ratio")
+            return None
+    if SNIPER_MODE and liquidity < MIN_SOL_PAIR_LIQUIDITY_USD * SNIPER_MIN_ENTRY_LIQUIDITY_MULTIPLIER:
+        reject("sniper_liquidity_buffer")
+        return None
+    if SNIPER_MODE:
+        # Illustrative constant-product estimate, NOT a live swap quote.
+        # Conservatively assume only half of reported USD pool liquidity is
+        # quote-side depth. Never approve a candidate with unavailable depth.
+        quote_depth_usd = liquidity / 2.0
+        entry_impact_pct = 100.0 * POSITION_SIZE_USD / (quote_depth_usd + POSITION_SIZE_USD) if quote_depth_usd > 0 else float("inf")
+        if entry_impact_pct > SNIPER_MAX_ENTRY_IMPACT_PCT:
+            reject("sniper_entry_impact")
+            return None
+    else:
+        entry_impact_pct = 0.0
+
+    if m5_sells == 0 and m5_buys >= 8:
+        # One-sided flow is often suspicious; avoid rather than assume it's bullish.
+        reject("one_sided_flow")
+        return None
+    if m5_buys + m5_sells < 8:
+        reject("insufficient_transactions")
+        return None
+    if ch5 > 80 or ch1 > 250:
+        # Avoid chasing extreme vertical moves.
+        reject("extreme_price_spike")
+        return None
+    if ch5 < -25 or ch1 < -45:
+        reject("price_collapse")
+        return None
+
+    # Heuristic score, not a predictive model. Each component is capped.
+    liquidity_score = min(25.0, liquidity / 2000.0)
+    volume_score = min(20.0, (m5_volume / 1000.0) * 5.0)
+    activity_score = min(15.0, (m5_buys + m5_sells) / 2.0)
+    buy_pressure = m5_buys / max(1.0, m5_buys + m5_sells)
+    flow_score = max(0.0, min(15.0, (buy_pressure - 0.45) * 50.0 + 7.5))
+    momentum_score = 0.0
+    if 0 < ch5 <= 15:
+        momentum_score += 8
+    elif -5 <= ch5 <= 0:
+        momentum_score += 4
+    if 0 < ch1 <= 35:
+        momentum_score += 7
+    elif -10 <= ch1 <= 0:
+        momentum_score += 3
+    age_score = (10.0 * max(0.0, 1.0 - age / max(SNIPER_MAX_AGE_MINUTES / 60, 0.001))
+                 if SNIPER_MODE else
+                 (10.0 if 0.25 <= age <= 24 else (6.0 if age <= 72 else 2.0)))
+    score = min(100.0, liquidity_score + volume_score + activity_score +
+                flow_score + momentum_score + age_score)
+
+    return {
+        "address": address,
+        "symbol": str(token.get("symbol") or "???")[:20],
+        "name": str(token.get("name") or "Unknown")[:50],
+        "price": price,
+        "liquidity": liquidity,
+        "m5_volume": m5_volume,
+        "h1_volume": h1_volume,
+        "h24_volume": h24_volume,
+        "m5_buys": int(m5_buys),
+        "m5_sells": int(m5_sells),
+        "change_m5": ch5,
+        "change_h1": ch1,
+        "age_hours": age,
+        "score": score,
+        "estimated_entry_impact_pct": entry_impact_pct,
+        "url": pair.get("url", ""),
+        "pool_address": pair.get("pairAddress", ""),
+        "pool_dex": (pair.get("dexId") or "").lower(),
+    }
+
+
+def equity(state: dict, current_prices: dict[str, float] | None = None) -> float:
+    current_prices = current_prices or {}
+    value = as_float(state["cash_usd"])
+    for mint, raw in state["positions"].items():
+        pos = Position(**raw)
+        issue = state.get("exit_issues", {}).get(mint, {})
+        if issue.get("status") == "IMPAIRED_EXIT_UNAVAILABLE":
+            # Conservative risk-value, NOT a realized sale or proof of zero recoverability.
+            continue
+        p = current_prices.get(mint, pos.last_price)
+        value += pos.token_units * p
+    return value
+
+
+def roll_day_if_needed(state: dict) -> None:
+    today = str(date.today())
+    if state.get("day") != today:
+        state["day"] = today
+        state["day_start_equity"] = equity(state)
+        # Unresolved safety events survive day rollover and deploys.
+        state["halted"] = bool(state.get("exit_issues")) or bool(state.get("halted"))
+        log.info("New day. Daily equity baseline reset to $%.2f", state["day_start_equity"])
+
+
+def should_halt(state: dict) -> bool:
+    baseline = as_float(state.get("day_start_equity"), STARTING_CAPITAL)
+    current = equity(state)
+    loss_fraction = (baseline - current) / max(1.0, baseline)
+    if loss_fraction >= MAX_DAILY_LOSS_FRACTION:
+        state["halted"] = True
+        log.error("DAILY LOSS LIMIT HIT: %.2f%%. New entries halted.", loss_fraction * 100)
+    return bool(state.get("halted"))
+
+
+def paper_prebuy_sellability(candidate: dict, pairs: list[dict] | None = None) -> tuple[bool, str]:
+    """Fresh read-only same-pool sell *estimate*, not executable swap simulation.
+
+    Reject if exact pair, orientation, route, price, reserves, or hypothetical
+    full-position liquidation depth cannot be verified. Fail closed on API errors.
+    """
+    mint = candidate.get("address", "")
+    pool = candidate.get("pool_address", "")
+    if not mint or not pool:
+        return False, "missing_pinned_entry_pool"
+    try:
+        observed = token_pairs(mint) if pairs is None else pairs
+    except Exception:
+        return False, "pool_recheck_unavailable"
+    matching = [p for p in observed if p.get("pairAddress") == pool
+                and p.get("chainId") == "solana"
+                and (p.get("baseToken") or {}).get("address") == mint
+                and (p.get("quoteToken") or {}).get("address") == SOL_MINT
+                and (p.get("dexId") or "").lower() in SUPPORTED_SOL_ROUTES]
+    if not matching:
+        return False, "entry_pool_missing_or_unsupported"
+    pair = matching[0]
+    observed_price = as_float(pair.get("priceUsd"))
+    depth = as_float((pair.get("liquidity") or {}).get("usd"))
+    size = POSITION_SIZE_USD
+    if observed_price <= 0 or depth < MIN_SOL_PAIR_LIQUIDITY_USD * (SNIPER_MIN_ENTRY_LIQUIDITY_MULTIPLIER if SNIPER_MODE else 1):
+        return False, "entry_pool_price_or_liquidity_unverified"
+    candidate_price = as_float(candidate.get("price"))
+    if candidate_price <= 0 or abs(observed_price / candidate_price - 1) > 0.10:
+        return False, "entry_pool_price_changed"
+    # Hypothetical full-position liquidation after modeled entry cost.
+    position = Position(token=mint, symbol=str(candidate.get("symbol", "?")),
+                        name=str(candidate.get("name", "?")), entry_price=observed_price * (1 + ESTIMATED_ROUND_TRIP_COST / 2),
+                        amount_usd=size, token_units=size / (observed_price * (1 + ESTIMATED_ROUND_TRIP_COST / 2)),
+                        opened_at=time.time(), peak_price=observed_price, last_price=observed_price,
+                        score=as_float(candidate.get("score")))
+    quote = paper_exit_quote(position, observed_price, depth)
+    if quote is None or quote["impact_pct"] > SNIPER_MAX_ENTRY_IMPACT_PCT:
+        return False, "same_pool_sell_impact_exceeds_limit"
+    # Injectable pairs make offline unit tests deterministic; actual candidates
+    # require a separate fresh data provider, never another token's pool.
+    if pairs is None and PAPER_PREBUY_INDEPENDENT_POOL_CHECK:
+        alternate = held_pool_fallback(pool, mint)
+        if alternate is None:
+            return False, "independent_same_pool_unavailable"
+        independent_liq = as_float(alternate.get("liquidity"))
+        independent_price = as_float(alternate.get("price"))
+        if independent_liq < depth * PAPER_PREBUY_MIN_CROSSCHECK_LIQUIDITY_RATIO or independent_liq < MIN_SOL_PAIR_LIQUIDITY_USD:
+            return False, "independent_same_pool_liquidity_disagreement"
+        if independent_price <= 0 or abs(independent_price / observed_price - 1) * 100 > PAPER_PREBUY_MAX_CROSSCHECK_PRICE_DEVIATION_PCT:
+            return False, "independent_same_pool_price_disagreement"
+        log.info("PAPER ENTRY POOL VERIFIED mint=%s pool=%s primary_liq=$%.0f secondary_liq=$%.0f primary_price=%.8g secondary_price=%.8g independent=indicative_only",
+                 mint, pool, depth, independent_liq, observed_price, independent_price)
+    return True, "indicative_same_pool_sell_depth_verified"
+
+
+def paper_buy(state: dict, c: dict) -> None:
+    if c["address"] in state["positions"]:
+        return
+    if len(state["positions"]) >= MAX_POSITIONS:
+        return
+    # Fixed position allocation, capped by available cash. This is position size,
+    # not the amount guaranteed to be lost; stop-losses can slip in volatile markets.
+    size = min(state["cash_usd"], POSITION_SIZE_USD)
+    if size < 5:
+        return
+    # Conservative paper entry haircut for spread/impact. Live costs can be worse.
+    entry = c["price"] * (1 + ESTIMATED_ROUND_TRIP_COST / 2)
+    units = size / entry
+    state["cash_usd"] -= size
+    state["positions"][c["address"]] = asdict(Position(
+        token=c["address"], symbol=c["symbol"], name=c["name"],
+        entry_price=entry, amount_usd=size, token_units=units,
+        opened_at=time.time(), peak_price=entry, last_price=entry, score=c["score"],
+        last_price_at=time.time(),
+        entry_pool_address=c.get("pool_address", ""),
+        entry_pool_dex=c.get("pool_dex", "")
+    ))
+    state.setdefault("paper_trade_metrics", {})[c["address"]] = {
+        "discovered_at": _first_discovered_at.get(c["address"]),
+        "entry_delay_seconds": (max(0.0, time.time() - _first_discovered_at[c["address"]])
+                                if c["address"] in _first_discovered_at else None),
+        "entry_score": c.get("score"), "entry_5m_change_pct": c.get("change_m5"),
+        "entry_buy_pressure": c.get("m5_buys", 0) / max(1, c.get("m5_buys", 0) + c.get("m5_sells", 0)),
+        "entry_5m_volume_usd": c.get("m5_volume"),
+        "max_favorable_net_pct": None, "max_adverse_net_pct": None,
+        "hit_take_profit_observed": False, "seconds_to_first_take_profit_observed": None, "observed_points": {},
+        "last_net_pct": None, "fallback_only_observations": 0, "unverified_exit_observations": 0,
+        "last_quote_source": "", "estimated_round_trip_cost_pct": ESTIMATED_ROUND_TRIP_COST * 100,
+        "recent_primary_prices": [], "reversal_exit_attempts": 0,
+        "shadow_c": {"status": "open", "tp_pct": SHADOW_STRATEGY_C_TP * 100,
+                     "sl_pct": SHADOW_STRATEGY_C_SL * 100, "exit_reason": None,
+                     "exit_net_pct": None, "exit_elapsed_seconds": None},
+    }
+    log.info("PAPER ENTRY METRICS %s discovery_to_entry_s=%s fee_haircut_est_pct=%.2f",
+             c["symbol"], state["paper_trade_metrics"][c["address"]]["entry_delay_seconds"], ESTIMATED_ROUND_TRIP_COST * 100)
+    state["seen_tokens"] = (state.get("seen_tokens", []) + [c["address"]])[-2000:]
+    log.info("PAPER BUY %s ($%.2f) score=%.1f price=%g", c["symbol"], size, c["score"], entry)
+
+
+def paper_exit_quote(pos: Position, price: float, liquidity_usd: float) -> dict | None:
+    """Conservative indicative proceeds, NOT a DEX executable quote.
+
+    A constant-product-style impact approximation assumes half of reported
+    pool USD liquidity is quote-side depth. Reject unknown/insufficient depth.
+    """
+    if price <= 0 or liquidity_usd <= 0 or pos.token_units <= 0:
+        return None
+    gross = pos.token_units * price
+    quote_depth = liquidity_usd * PAPER_EXIT_LIQUIDITY_FRACTION
+    if quote_depth <= 0:
+        return None
+    impact = gross / (quote_depth + gross)
+    if impact > PAPER_MAX_EXIT_IMPACT:
+        return None
+    cost = max(0.0, min(0.99, ESTIMATED_ROUND_TRIP_COST / 2))
+    proceeds = gross * (1 - impact) * (1 - cost)
+    return {"proceeds_usd": proceeds, "impact_pct": impact * 100,
+            "exit_price": proceeds / pos.token_units, "liquidity_usd": liquidity_usd}
+
+
+def paper_exit_failure_reason(pos: Position, price: float, liquidity_usd: float, quote_source: str = "") -> str | None:
+    """Explain why an indicative exit can't be validated; never fabricate a fill."""
+    if quote_source == "geckoterminal_indicative" and PAPER_EXIT_REQUIRE_PRIMARY_QUOTE:
+        return "primary_pool_quote_missing_fallback_valuation_only"
+    if price <= 0:
+        return "missing_exit_price"
+    if liquidity_usd <= 0:
+        return "missing_exit_liquidity"
+    if pos.token_units <= 0:
+        return "invalid_position_units"
+    gross = pos.token_units * price
+    depth = liquidity_usd * PAPER_EXIT_LIQUIDITY_FRACTION
+    if depth <= 0:
+        return "missing_quote_side_depth"
+    impact = gross / (depth + gross)
+    if impact > PAPER_MAX_EXIT_IMPACT:
+        return "excessive_estimated_exit_impact"
+    return None
+
+
+def note_unavailable_exit(state: dict, mint: str, symbol: str, reason: str) -> None:
+    """Persist an unresolved PAPER exit and rate-limit errors per mint.
+
+    This is NOT a sell, realized loss, or executable quote. The original
+    position and invested cash remain unchanged and new entries stay halted.
+    """
+    now = time.time()
+    issues = state.setdefault("exit_issues", {})
+    item = issues.get(mint)
+    if not isinstance(item, dict):
+        item = {"status": "EXIT_UNAVAILABLE", "first_seen_at": now,
+                "last_logged_at": 0.0, "checks": 0}
+        issues[mint] = item
+    age = now - float(item.get("first_seen_at", now))
+    next_checks = int(item.get("checks", 0)) + 1
+    if age >= PAPER_IMPAIRED_AFTER_SECONDS and next_checks >= PAPER_IMPAIRED_AFTER_CHECKS:
+        if item.get("status") != "IMPAIRED_EXIT_UNAVAILABLE":
+            log.warning("PAPER POSITION IMPAIRED %s mint=%s cost_retained_not_realized=$%.2f conservative_value=$0; exit still monitored", symbol, mint,
+                        as_float(state.get("positions", {}).get(mint, {}).get("amount_usd")))
+        item["status"] = "IMPAIRED_EXIT_UNAVAILABLE"
+    else:
+        item["status"] = "EXIT_UNAVAILABLE"
+    item["reason"] = reason
+    item["last_checked_at"] = now
+    item["checks"] = int(item.get("checks", 0)) + 1
+    state["halted"] = True
+    last_log = float(item.get("last_logged_at", 0))
+    if last_log <= 0 or now - last_log >= PAPER_EXIT_WARNING_INTERVAL_SECONDS:
+        log.error("PAPER EXIT UNAVAILABLE %s mint=%s reason=%s checks=%d; "
+                  "position retained, no sale assumed, new entries halted; rechecking every cycle",
+                  symbol, mint, reason, item["checks"])
+        item["last_logged_at"] = now
+
+
+def clear_exit_issue(state: dict, mint: str, symbol: str) -> None:
+    """Clear a recovered quote alert; never automatically remove safety halt."""
+    item = state.get("exit_issues", {}).pop(mint, None)
+    if item:
+        log.info("PAPER EXIT QUOTE RECOVERED %s mint=%s; previous unresolved status cleared; "
+                 "safety halt remains until operator review", symbol, mint)
+
+
+def close_position(state: dict, mint: str, price: float, reason: str, liquidity_usd: float | None = None, quote_source: str = "") -> bool:
+    raw = state["positions"].get(mint)
+    if not raw:
+        return False
+    pos = Position(**raw)
+    failure = paper_exit_failure_reason(pos, price, liquidity_usd or 0, quote_source)
+    quote = None if failure else paper_exit_quote(pos, price, liquidity_usd or 0)
+    if quote is None:
+        note_unavailable_exit(state, mint, pos.symbol, failure or "exit_quote_unavailable")
+        return False
+    clear_exit_issue(state, mint, pos.symbol)
+    exit_price = quote["exit_price"]
+    proceeds = quote["proceeds_usd"]
+    pnl = proceeds - pos.amount_usd
+    state["cash_usd"] += proceeds
+    metrics = state.setdefault("paper_trade_metrics", {}).pop(mint, {})
+    if metrics.get("max_favorable_net_pct") is not None:
+        metrics["hit_take_profit_observed"] = bool(metrics.get("hit_take_profit_observed") or metrics["max_favorable_net_pct"] >= TAKE_PROFIT * 100)
+    shadow = metrics.setdefault("shadow_c", {})
+    if shadow.get("status") == "open":
+        shadow.update(status="closed_at_actual_exit", exit_reason="actual_trade_closed_first",
+                      exit_net_pct=round(pnl / max(pos.amount_usd, 1e-15) * 100, 3),
+                      exit_elapsed_seconds=round(max(0, time.time()-pos.opened_at), 2))
+    log.info("PAPER SHADOW C %s status=%s reason=%s net_pct=%s seconds=%s [paper_estimate_only]",
+             pos.symbol, shadow.get("status"), shadow.get("exit_reason"), shadow.get("exit_net_pct"), shadow.get("exit_elapsed_seconds"))
+    log.info("PAPER TRADE METRICS %s entry_delay_s=%s mfe_net_pct=%s mae_net_pct=%s hit_tp_observed=%s seconds_to_tp=%s points=%s round_trip_cost_assumption_pct=%.2f exit_impact_est_pct=%.3f",
+             pos.symbol, metrics.get("entry_delay_seconds"), metrics.get("max_favorable_net_pct"),
+             metrics.get("max_adverse_net_pct"), metrics.get("hit_take_profit_observed"),
+             metrics.get("seconds_to_first_take_profit_observed"), metrics.get("observed_points", {}), ESTIMATED_ROUND_TRIP_COST * 100, quote["impact_pct"])
+    state["closed_trades"].append({
+        "closed_at": now_iso(), "token": mint, "symbol": pos.symbol,
+        "entry_price": pos.entry_price, "exit_price": exit_price,
+        "invested_usd": pos.amount_usd, "proceeds_usd": proceeds,
+        "pnl_usd": pnl, "pnl_pct": pnl / max(1.0, pos.amount_usd) * 100,
+        "reason": reason, "paper_metrics": metrics, "estimated_impact_pct": quote["impact_pct"],
+        "pool_liquidity_usd": quote["liquidity_usd"], "quote_source": quote_source or "primary_pool_indicative", "execution": "paper_estimate_only"
+    })
+    state["closed_trades"] = state["closed_trades"][-1000:]
+    del state["positions"][mint]
+    log.info("PAPER SELL %s reason=%s PnL=$%.2f (%.1f%%) impact≈%.2f%% [estimate only]", pos.symbol, reason, pnl,
+             pnl / max(1.0, pos.amount_usd) * 100, quote["impact_pct"])
+    return True
+
+
+_pool_fallback_cache: dict[tuple[str, str], tuple[float, dict | None]] = {}
+
+
+def held_pool_fallback(pool_address: str, mint: str = "") -> dict | None:
+    """Secondary, pool-pinned read-only observation. Never infer liquidity.
+
+    GeckoTerminal reserve_in_usd and base_token_price_usd can be stale or
+    inaccurate. This is an indicative fallback for PAPER estimates only.
+    """
+    if not pool_address or not (32 <= len(pool_address) <= 64):
+        return None
+    now = time.monotonic()
+    key = (pool_address, mint)
+    old = _pool_fallback_cache.get(key)
+    if old and now < old[0]:
+        return old[1]
+    outcome = None
+    try:
+        response = session.get(
+            f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool_address}",
+            timeout=8, headers={"Accept": "application/json;version=20230203"})
+        response.raise_for_status()
+        pool_data = response.json().get("data") or {}
+        base_id = (((pool_data.get("relationships") or {}).get("base_token") or {}).get("data") or {}).get("id", "")
+        if mint and base_id != "solana_" + mint:
+            raise ValueError("fallback pool base token does not match held mint")
+        attributes = pool_data.get("attributes") or {}
+        price = as_float(attributes.get("base_token_price_usd"))
+        liquidity = as_float(attributes.get("reserve_in_usd"))
+        if price > 0 and liquidity > 0:
+            outcome = {"price": price, "liquidity": liquidity,
+                       "pool_address": pool_address, "quote_source": "geckoterminal_indicative"}
+    except Exception as exc:
+        log.debug("Secondary pool lookup failed pool=%s: %s", pool_address, type(exc).__name__)
+    _pool_fallback_cache[key] = (now + PAPER_POOL_FALLBACK_SECONDS, outcome)
+    if len(_pool_fallback_cache) > 500:
+        for key in list(_pool_fallback_cache)[:100]:
+            _pool_fallback_cache.pop(key, None)
+    return outcome
+
+
+def manage_positions(state: dict, market: dict[str, dict]) -> None:
+    for mint in list(state["positions"].keys()):
+        raw = state["positions"][mint]
+        pos = Position(**raw)
+        c = market.get(mint)
+        if not c or as_float(c.get("price")) <= 0:
+            # Never invent a price. Halt new entries if a held position has no
+            # usable quote for too long; its mark-to-market value is uncertain.
+            last_valid = pos.last_price_at or pos.opened_at
+            stale_for = max(0.0, time.time() - last_valid)
+            if stale_for >= MAX_STALE_PRICE_SECONDS:
+                note_unavailable_exit(state, mint, pos.symbol, "stale_or_missing_price")
+            continue
+        price = c["price"]
+        pos.last_price = price
+        pos.last_price_at = time.time()
+        pos.peak_price = max(pos.peak_price, price)
+        raw.update(asdict(pos))
+        # Evaluate TP/SL against estimated net proceeds, including the paper
+        # execution haircut, rather than the raw market-price change alone.
+        liquidity = as_float(c.get("liquidity"))
+        source = str(c.get("quote_source", "dexscreener"))
+        metrics = state.setdefault("paper_trade_metrics", {}).setdefault(mint, {})
+        metrics["last_quote_source"] = source
+        if source == "geckoterminal_indicative":
+            metrics["fallback_only_observations"] = int(metrics.get("fallback_only_observations", 0)) + 1
+        failure = paper_exit_failure_reason(pos, price, liquidity, source)
+        quote = None if failure else paper_exit_quote(pos, price, liquidity)
+        if quote is None:
+            metrics["unverified_exit_observations"] = int(metrics.get("unverified_exit_observations", 0)) + 1
+            note_unavailable_exit(state, mint, pos.symbol, failure or "exit_quote_unavailable")
+            continue
+        clear_exit_issue(state, mint, pos.symbol)
+        net_return = quote["proceeds_usd"] / max(pos.amount_usd, 1e-15) - 1
+        metrics = state.setdefault("paper_trade_metrics", {}).setdefault(mint, {})
+        net_pct = net_return * 100
+        old_max = metrics.get("max_favorable_net_pct")
+        old_min = metrics.get("max_adverse_net_pct")
+        metrics["max_favorable_net_pct"] = max(old_max, net_pct) if old_max is not None else net_pct
+        metrics["max_adverse_net_pct"] = min(old_min, net_pct) if old_min is not None else net_pct
+        metrics["last_net_pct"] = net_pct
+        if net_return >= TAKE_PROFIT and metrics.get("seconds_to_first_take_profit_observed") is None:
+            metrics["seconds_to_first_take_profit_observed"] = round(max(0.0, time.time() - pos.opened_at), 2)
+        metrics["hit_take_profit_observed"] = bool(metrics.get("hit_take_profit_observed") or net_return >= TAKE_PROFIT)
+        # Record virtual Strategy C without changing this position's real paper rules.
+        shadow = metrics.setdefault("shadow_c", {"status": "open"})
+        if shadow.get("status") == "open":
+            shadow_reason = ("take_profit" if net_return >= SHADOW_STRATEGY_C_TP else
+                             "stop_loss" if net_return <= -SHADOW_STRATEGY_C_SL else None)
+            if shadow_reason:
+                shadow.update(status="closed", exit_reason=shadow_reason,
+                              exit_net_pct=round(net_pct, 3),
+                              exit_elapsed_seconds=round(max(0, time.time()-pos.opened_at), 2))
+                log.info("PAPER SHADOW C %s reason=%s estimated_net_pct=%.2f elapsed_s=%.1f [no simulated fill guarantee]",
+                         pos.symbol, shadow_reason, net_pct, shadow["exit_elapsed_seconds"])
+        # Feed reversal detector only verified primary-pool quotes.
+        reversal_signal = False
+        reversal_details = {}
+        if source != "geckoterminal_indicative" and PAPER_REVERSAL_EXIT_ENABLED:
+            primary_prices = metrics.setdefault("recent_primary_prices", [])
+            primary_prices.append([time.time(), price])
+            primary_prices[:] = [(t,p) for t,p in primary_prices if time.time()-t <= PAPER_REVERSAL_LOOKBACK_SECONDS]
+            reversal_signal, reversal_details = detect_immediate_reversal(primary_prices, now=time.time(), opened_at=pos.opened_at)
+        held_seconds = max(0.0, time.time() - pos.opened_at)
+        points = metrics.setdefault("observed_points", {})
+        for seconds in (30, 60, 120):
+            if held_seconds >= seconds and str(seconds) not in points:
+                points[str(seconds)] = {"elapsed_seconds": round(held_seconds, 1), "net_return_pct": round(net_pct, 3)}
+                log.info("PAPER MILESTONE %s target=%ds observed_at=%.1fs estimated_net_pct=%.2f", pos.symbol, seconds, held_seconds, net_pct)
+        peak_return = price / max(pos.peak_price, 1e-15) - 1
+        if net_return >= TAKE_PROFIT:
+            close_position(state, mint, price, "take_profit", liquidity, source)
+        elif net_return <= -STOP_LOSS:
+            close_position(state, mint, price, "stop_loss", liquidity, source)
+        elif reversal_signal:
+            metrics["reversal_exit_attempts"] = int(metrics.get("reversal_exit_attempts", 0)) + 1
+            log.warning("PAPER REVERSAL EXIT SIGNAL %s decline=%.2f%% observations=%d source=%s; checking verified indicative exit",
+                        pos.symbol, reversal_details["drop_pct"], reversal_details["observations"], source)
+            close_position(state, mint, price, "immediate_reversal", liquidity, source)
+        elif MAX_HOLD_MINUTES > 0 and time.time() - pos.opened_at >= MAX_HOLD_MINUTES * 60:
+            close_position(state, mint, price, "time_limit", liquidity, source)
+        elif TRAILING_STOP_ENABLED and pos.peak_price > pos.entry_price and peak_return <= -TRAILING_STOP:
+            close_position(state, mint, price, "trailing_stop", liquidity, source)
+        elif c["liquidity"] < MIN_LIQUIDITY_USD * 0.65:
+            close_position(state, mint, price, "liquidity_deterioration", liquidity, source)
+
+
+_candidate_price_history: dict[str, list[tuple[float, float, float | None]]] = {}
+
+
+def candidate_momentum_confirm(mint: str, price: float, *, now: float | None = None, buy_pressure: float | None = None) -> tuple[bool, str]:
+    """Two independent observations from entry scans; never assume unseen momentum.
+
+    First sightings are watched, not instantly purchased. A short-term price
+    decline is never interpreted as upward confirmation.
+    """
+    now = time.time() if now is None else now
+    if not ENTRY_TREND_CONFIRM_ENABLED:
+        return True, "disabled"
+    if price <= 0:
+        return False, "no_current_price"
+    history = _candidate_price_history.setdefault(mint, [])
+    history[:] = [(t, p, b) for t, p, b in history if 0 <= now-t <= ENTRY_TREND_MAX_OBSERVATION_SECONDS]
+    baseline = next(((t, p, b) for t, p, b in history if now-t >= ENTRY_TREND_MIN_OBSERVATION_SECONDS), None)
+    history.append((now, price, buy_pressure))
+    if len(_candidate_price_history) > 2500:
+        for old in list(_candidate_price_history)[:250]:
+            _candidate_price_history.pop(old, None)
+    if baseline is None:
+        return False, "awaiting_second_price_observation"
+    change = (price / baseline[1] - 1) * 100
+    if change < ENTRY_TREND_MIN_CHANGE_PCT:
+        return False, f"short_momentum_not_confirmed:{change:.2f}pct"
+    if buy_pressure is not None and baseline[2] is not None and buy_pressure < baseline[2] - ENTRY_TREND_MAX_BUY_PRESSURE_DROP:
+        return False, f"buy_pressure_fading:{buy_pressure:.3f}_vs_{baseline[2]:.3f}"
+    return True, f"confirmed:{change:.2f}pct"
+
+
+def detect_immediate_reversal(history: list, *, now: float, opened_at: float) -> tuple[bool, dict]:
+    """Confirmed recent fall from a recent high; use quote values only, no fills."""
+    window = [(float(t), float(p)) for t, p in history
+              if isinstance(t, (int, float)) and isinstance(p, (int, float))
+              and p > 0 and 0 <= now - t <= PAPER_REVERSAL_LOOKBACK_SECONDS]
+    if now - opened_at < PAPER_REVERSAL_MIN_HOLD_SECONDS or len(window) < PAPER_REVERSAL_CONFIRM_OBSERVATIONS:
+        return False, {"status": "insufficient_recent_history"}
+    window.sort()
+    # Require a distinct prior high and multiple observations after that high.
+    peak_index = max(range(len(window)), key=lambda i: window[i][1])
+    confirmations = window[peak_index+1:]
+    if len(confirmations) < PAPER_REVERSAL_CONFIRM_OBSERVATIONS - 1:
+        return False, {"status": "insufficient_post_peak_confirmation"}
+    peak = window[peak_index][1]
+    drop_pct = (1 - window[-1][1] / peak) * 100
+    # Consecutively deteriorating prices, not a single volatile quote.
+    declining = all(confirmations[i][1] <= confirmations[i-1][1] for i in range(1, len(confirmations)))
+    recent = now-window[-1][0] <= PAPER_REVERSAL_MAX_QUOTE_AGE_SECONDS
+    result = {"status": "reversal" if (declining and recent and drop_pct >= PAPER_REVERSAL_MIN_DROP_PCT) else "no_reversal",
+              "drop_pct": round(drop_pct, 2), "peak_price": peak, "observations": len(window)}
+    return result["status"] == "reversal", result
+
+_first_discovered_at: OrderedDict[str, float] = OrderedDict()
+_entry_scan_next_at = 0.0
+_entry_scan_cursor = 0
+# Revisit previously confirmed SOL-quoted, supported, sufficiently liquid DEX
+# markets. These are candidates for momentum re-evaluation, NOT auto-buys.
+_verified_dex_mints: OrderedDict[str, float] = OrderedDict()
+_entry_reject_until: OrderedDict[str, float] = OrderedDict()
+_entry_reject_reason: dict[str, str] = {}
+
+def note_entry_rejection(mint: str, reason: str, *, now: float | None = None) -> None:
+    """Temporarily deprioritize unsupported or unindexed mints, never ban permanently."""
+    stamp = time.monotonic() if now is None else now
+    ttl = MISSING_DATA_COOLDOWN_SECONDS if reason in ("pair_not_indexed", "supported_pair_liquidity_unavailable", "supported_pair_missing_price") else STRUCTURAL_REJECT_COOLDOWN_SECONDS
+    _entry_reject_until[mint] = stamp + ttl
+    _entry_reject_until.move_to_end(mint)
+    _entry_reject_reason[mint] = reason
+    while len(_entry_reject_until) > 2500:
+        old, _ = _entry_reject_until.popitem(last=False)
+        _entry_reject_reason.pop(old, None)
+
+def mint_cooling_down(mint: str, *, now: float | None = None) -> bool:
+    stamp = time.monotonic() if now is None else now
+    until = _entry_reject_until.get(mint, 0.0)
+    if until <= stamp:
+        _entry_reject_until.pop(mint, None)
+        _entry_reject_reason.pop(mint, None)
+        return False
+    return True
+
+
+
+def note_verified_dex_mint(mint: str, *, now: float | None = None) -> None:
+    if not mint or mint == SOL_MINT:
+        return
+    stamp = time.monotonic() if now is None else now
+    _entry_reject_until.pop(mint, None)
+    _entry_reject_reason.pop(mint, None)
+    _verified_dex_mints[mint] = stamp + VERIFIED_DEX_TTL_SECONDS
+    _verified_dex_mints.move_to_end(mint)
+    while len(_verified_dex_mints) > 250:
+        _verified_dex_mints.popitem(last=False)
+
+
+def verified_dex_due(*, now: float | None = None, limit: int | None = None) -> list[str]:
+    stamp = time.monotonic() if now is None else now
+    for mint, expires_at in list(_verified_dex_mints.items()):
+        if expires_at <= stamp:
+            _verified_dex_mints.pop(mint, None)
+    cap = VERIFIED_DEX_RECHECK_QUOTA if limit is None else limit
+    return list(reversed(_verified_dex_mints))[:max(0, cap)]
+
+
+def update_sniper_watchlist(scores: dict[str, float], *, now: float | None = None) -> None:
+    """Store Stage-1 hints for repeat evaluation, bounded by both TTL and size.
+
+    This is discovery-only: no score or cached quote ever authorizes a buy.
+    """
+    stamp = time.monotonic() if now is None else now
+    for mint, (expiry, _) in list(_sniper_watchlist.items()):
+        if expiry <= stamp:
+            _sniper_watchlist.pop(mint, None)
+    for mint, score in scores.items():
+        if not mint or mint == SOL_MINT:
+            continue
+        _sniper_watchlist[mint] = (stamp + SNIPER_WATCHLIST_TTL_SECONDS, score)
+        _sniper_watchlist.move_to_end(mint)
+    while len(_sniper_watchlist) > SNIPER_WATCHLIST_LIMIT:
+        _sniper_watchlist.popitem(last=False)
+
+
+def sniper_watchlist_due(*, now: float | None = None, limit: int | None = None) -> list[str]:
+    """Rotate across Stage-1 markets so older watched pools are not starved."""
+    global _sniper_watch_cursor
+    stamp = time.monotonic() if now is None else now
+    update_sniper_watchlist({}, now=stamp)
+    pool = [mint for mint in _sniper_watchlist if not mint_cooling_down(mint, now=stamp)]
+    if not pool:
+        return []
+    n = min(len(pool), SNIPER_WATCHLIST_RECHECK_QUOTA if limit is None else max(0, limit))
+    start = _sniper_watch_cursor % len(pool)
+    chosen = [pool[(start + i) % len(pool)] for i in range(n)]
+    _sniper_watch_cursor = (start + n) % len(pool)
+    return chosen
+
+
+def select_entry_mints(addresses: list[str], fresh_due: list[str], *, count: int, cursor: int) -> tuple[list[str], int, int]:
+    """Reserve slots for verified pools; share the rest with fresh and rotating discovery.
+
+    This only selects mints for new API lookups. No cached price, liquidity or
+    momentum score is trusted for an actual trade.
+    """
+    cap = max(0, count)
+    if SNIPER_MODE:
+        selected = []
+        # Stage 2: rotate across all watched pools, not only the few currently
+        # meeting volume/price momentum. Recheck their CURRENT DexScreener data.
+        for mint in sniper_watchlist_due(limit=min(SNIPER_WATCHLIST_RECHECK_QUOTA, cap)):
+            if mint not in selected:
+                selected.append(mint)
+        for mint in verified_dex_due(limit=min(SNIPER_VERIFIED_RECHECK_QUOTA, max(0, cap - len(selected)))):
+            if mint not in selected:
+                selected.append(mint)
+        fresh_n = 0
+        for mint in fresh_due:
+            if len(selected) >= cap or fresh_n >= min(SNIPER_LAUNCH_PROBE_QUOTA, FRESH_LAUNCH_SCAN_QUOTA):
+                break
+            if mint not in selected and not mint_cooling_down(mint):
+                selected.append(mint)
+                fresh_n += 1
+        return selected, cursor, fresh_n
+    # Cooldowns apply only to new entry lookups; verified pools are rechecked.
+    selected = list(dict.fromkeys(verified_dex_due(limit=min(VERIFIED_DEX_RECHECK_QUOTA, cap))))
+    selected = selected[:cap]
+    # Fill with independently sourced liquid-pool hints before unindexed launches.
+    quality_selected = 0
+    for mint in _quality_pool_mints:
+        if quality_selected >= QUALITY_POOL_SCAN_QUOTA or len(selected) >= cap:
+            break
+        if mint not in selected and not mint_cooling_down(mint):
+            selected.append(mint)
+            quality_selected += 1
+    fresh_cap = min(FRESH_LAUNCH_SCAN_QUOTA, cap - len(selected))
+    prioritized_fresh = []
+    for mint in fresh_due:
+        if mint not in selected and not mint_cooling_down(mint) and len(prioritized_fresh) < fresh_cap:
+            prioritized_fresh.append(mint)
+    selected.extend(prioritized_fresh)
+    # Older indexed pools discovered through search are also valuable.
+    search = sorted((m for m in addresses if m in _discovery_priority and m not in selected and not mint_cooling_down(m)),
+                    key=lambda m: _discovery_priority[m], reverse=True)
+    for mint in search[:max(0, (cap - len(selected)) // 2)]:
+        selected.append(mint)
+    rotating = [m for m in dict.fromkeys(addresses) if m not in selected and not mint_cooling_down(m)]
+    remaining = cap - len(selected)
+    chosen = [rotating[(cursor + i) % len(rotating)] for i in range(min(remaining, len(rotating)))] if rotating else []
+    selected.extend(chosen)
+    return selected, (cursor + len(chosen)) % max(1, len(rotating)), len(prioritized_fresh)
+
+
+
+def scan_once(state: dict) -> None:
+    global _entry_scan_next_at, _entry_scan_cursor
+    # Always manage existing positions; discovery is a separate, slower job.
+    now = time.monotonic()
+    scan_entries = now >= _entry_scan_next_at and api_cooldown_remaining() <= 0
+    if scan_entries:
+        _entry_scan_next_at = now + ENTRY_SCAN_INTERVAL_SECONDS
+    addresses = latest_candidate_addresses() if scan_entries else []
+    if addresses:
+        for mint in addresses:
+            _first_discovered_at.setdefault(mint, time.time())
+        while len(_first_discovered_at) > 3000:
+            _first_discovered_at.popitem(last=False)
+        count = min(MAX_ENTRY_TOKENS_PER_SCAN, max(len(addresses), len(_verified_dex_mints)))
+        discovery_total = len(addresses)
+        cooling_before = sum(mint_cooling_down(m) for m in addresses)
+        stream_set = set(fresh_launch_snapshot())
+        stream_priority = due_fresh_launches(limit=min(count, FRESH_LAUNCH_SCAN_QUOTA))
+        addresses, _entry_scan_cursor, fresh_selected = select_entry_mints(
+            addresses, stream_priority, count=count, cursor=_entry_scan_cursor)
+        log.info("ENTRY SCAN tokens=%d discovery_total=%d cooling_discovery=%d fresh_due=%d verified_dex_selected=%d verified_dex_watched=%d quality_pool_selected=%d quality_pool_watched=%d feed_connected=%s feed_messages=%d feed_reconnects=%d next_in=%ds",
+                 len(addresses), discovery_total, cooling_before, fresh_selected, len([m for m in addresses if m in _verified_dex_mints]),
+                 len(_verified_dex_mints), len([m for m in addresses if m in _quality_pool_mints]), len(_quality_pool_mints), _feed_connected, _feed_messages, _feed_reconnects, ENTRY_SCAN_INTERVAL_SECONDS)
+        if SNIPER_MODE:
+            log.info("SNIPER STAGES watchlist=%d checked=%d fresh_probes=%d stage2_entry_requires=verified_dex_momentum", len(_sniper_watchlist), len([m for m in addresses if m in _sniper_watchlist]), fresh_selected)
+    elif api_cooldown_remaining() > 0:
+        log.info("ENTRY SCAN paused: DexScreener cooldown %.0fs", api_cooldown_remaining())
+    market: dict[str, dict] = {}
+    rejection_counts: Counter = Counter()
+    route_rejections: Counter = Counter()
+    evaluated = 0
+    missing_pairs = 0
+    market_data_rejections: Counter = Counter()
+    verified_market_this_scan = 0
+    eligible_verified = 0
+    eligible_search = 0
+    checked_mints: set[str] = set()
+    curve_checks = 0
+    curve_outcomes: Counter = Counter()
+    curve_pending: list[str] = []
+    curve_quote_ready = 0
+    curve_activity_ready = 0
+    curve_activity_observed_threshold_met = 0
+    curve_reserve_observation_ready = 0
+    for start in range(0, len(addresses), ENTRY_BATCH_SIZE):
+        batch = addresses[start:start + ENTRY_BATCH_SIZE]
+        if not batch:
+            continue
+        try:
+            data = get_json(f"{BASE}/tokens/v1/solana/{','.join(batch)}")
+            pairs = data if isinstance(data, list) else []
+            # Select eligible SOL-quoted PumpPortal routes for new entries only.
+            grouped: dict[str, list[dict]] = {}
+            for p in pairs:
+                mint = (p.get("baseToken") or {}).get("address")
+                if mint:
+                    grouped.setdefault(mint, []).append(p)
+            for mint in batch:
+                checked_mints.add(mint)
+                if mint not in grouped:
+                    missing_pairs += 1
+                    market_data_rejections["pair_not_indexed"] += 1
+                    # A missing index response is not evidence that yesterday's
+                    # verified pool disappeared. Retain it until its TTL expires.
+                    mark_fresh_checked(mint, "pair_not_indexed")
+                    if mint not in _verified_dex_mints:
+                        note_entry_rejection(mint, "pair_not_indexed")
+                    if mint in stream_set:
+                        curve_pending.append(mint)
+            for mint, mint_pairs in grouped.items():
+                evaluated += 1
+                pair = best_entry_pair(mint_pairs)
+                if pair is None:
+                    # Log a useful reason for the deepest pool rather than scoring it.
+                    diagnostic, representative = entry_pair_diagnostic(mint_pairs)
+                    market_data_rejections[diagnostic] += 1
+                    if representative:
+                        reason = entry_pair_reason(representative) or diagnostic
+                        route_rejections[reason.split(" ")[0]] += 1
+                        log.info("REJECT %s: %s (market_data=%s)", (representative.get("baseToken") or {}).get("symbol", mint), reason, diagnostic)
+                    else:
+                        log.info("REJECT %s: %s", mint, diagnostic)
+                    if diagnostic not in ("supported_pair_liquidity_unavailable", "supported_pair_missing_price"):
+                        # Confirmed low liquidity / unsupported route invalidates
+                        # the verified entry, unlike transient missing data.
+                        _verified_dex_mints.pop(mint, None)
+                    mark_fresh_checked(mint, diagnostic)
+                    if mint not in _verified_dex_mints:
+                        note_entry_rejection(mint, diagnostic)
+                    if mint in stream_set and diagnostic in ("supported_pair_liquidity_unavailable", "supported_pair_missing_price", "no_sol_quoted_pair"):
+                        curve_pending.append(mint)
+                    continue
+                # Record only markets re-verified from fresh pair data.
+                was_verified = mint in _verified_dex_mints
+                verified_market_this_scan += 1
+                note_verified_dex_mint(mint)
+                c = analyze_pair(pair, rejection_counts)
+                if SNIPER_MODE and age_hours(pair) > SNIPER_MAX_AGE_MINUTES / 60.0:
+                    _sniper_watchlist.pop(mint, None)
+                mark_fresh_checked(mint, "eligible" if c else "momentum_rejected")
+                if c:
+                    eligible_verified += int(was_verified)
+                    eligible_search += int(mint in _discovery_priority)
+                    c["pumpportal_pool"] = SUPPORTED_SOL_ROUTES[pair["dexId"].lower()]
+                    market[mint] = c
+        except DexRateLimited:
+            break
+        except Exception as exc:
+            log.warning("Batch token lookup failed: %s", exc)
+
+    # Read-only on-chain fallback for fresh launches. This supplies genuine
+    # bonding-curve status/reserves, NOT a substitute DEX liquidity number.
+    if scan_entries and PUMP_CURVE_LOOKUP_ENABLED and SOLANA_RPC_URL:
+        for mint in dict.fromkeys(curve_pending):
+            if curve_checks >= PUMP_CURVE_LOOKUPS_PER_SCAN:
+                break
+            curve_checks += 1
+            try:
+                info = lookup_curve(mint, SOLANA_RPC_URL)
+                status = info["status"]
+                curve_outcomes[status] += 1
+                if status in ("active_bonding_curve", "graduated"):
+                    if status == "active_bonding_curve":
+                        note_active_curve(mint, info.get("real_sol_reserve"))
+                    # A 0.1 SOL quote checks reserve arithmetic without treating
+                    # virtual reserves as verified liquidity or enabling entries.
+                    indicative = buy_quote(info, 0.1)
+                    if indicative:
+                        curve_quote_ready += 1
+                        activity = _curve_activity.summary(mint)
+                        # Trade activity is diagnostic only; for modern quote-token
+                        # curves the event's quote amount isn't necessarily SOL.
+                        # Never make entry eligibility depend on assumed quote units.
+                        reserve_observation_ready = info["real_sol_reserve"] >= CURVE_MIN_REAL_SOL_FOR_OBSERVATION
+                        curve_reserve_observation_ready += int(reserve_observation_ready)
+                        observed_threshold = activity['trades'] >= CURVE_ACTIVITY_MIN_TRADES
+                        curve_activity_observed_threshold_met += int(observed_threshold)
+                        ready = False  # quote-mint/fee/exits not yet validated for curve entries
+                        curve_activity_ready += int(ready)
+                        log.info("CURVE ACTIVITY mint=%s source=solana_rpc trades5m=%d buys=%d sells=%d unverified_quote_amount_as_sol=%.4f observed_trade_threshold=%s reserve_observation_ready=%s activity_ready=%s entry=blocked_pending_execution_validation",
+                                 mint, activity['trades'], activity['buys'], activity['sells'], activity['volume_sol'], observed_threshold, reserve_observation_ready, ready)
+                        log.info("CURVE QUOTE mint=%s buy_sol=0.1 token_raw=%.0f impact=%.3f%% real_sol=%.4f entry=blocked_pending_execution_validation",
+                                 mint, indicative["token_raw"], indicative["impact"] * 100, info["real_sol_reserve"])
+                    else:
+                        log.info("CURVE DATA mint=%s status=%s real_sol=%.4f quote=unavailable entry=blocked",
+                                 mint, status, info["real_sol_reserve"])
+                else:
+                    log.info("CURVE DATA mint=%s status=%s entry=blocked", mint, status)
+            except Exception as exc:
+                curve_outcomes["lookup_error"] += 1
+                log.warning("CURVE LOOKUP failed mint=%s error=%s", mint, type(exc).__name__)
+
+    if scan_entries and CURVE_ACTIVITY_ENABLED:
+        # Subscribe to a rotating bounded selection of fresh launches, including
+        # mints awaiting their first DexScreener pair. This is observation only.
+        # Watchlist is populated on launch arrival; never replace it with scan subset.
+        pass
+    if scan_entries:
+        log.info("FILTER SUMMARY evaluated=%d eligible=%d pair_not_indexed=%d route_rejections=%s momentum_rejections=%s market_data_rejections=%s fresh_check_outcomes=%s curve_checks=%d curve_outcomes=%s curve_quote_ready=%d curve_reserve_observation_ready=%d curve_activity_observed_threshold_met=%d curve_activity_ready=%d curve_activity_source=solana_rpc verified_market_this_scan=%d eligible_verified=%d eligible_search=%d cooling_total=%d curve_trade_diagnostics=%s",
+                 evaluated, len(market), missing_pairs, dict(route_rejections), dict(rejection_counts), dict(market_data_rejections), fresh_check_counts(), curve_checks, dict(curve_outcomes), curve_quote_ready, curve_reserve_observation_ready, curve_activity_observed_threshold_met, curve_activity_ready, verified_market_this_scan, eligible_verified, eligible_search, len(_entry_reject_until), curve_activity_diagnostics())
+
+    # Held positions must follow the IDENTICAL pool used at entry, never the
+    # deepest or currently trending pool for the same token mint.
+    for mint, raw in state["positions"].items():
+        pool_id = raw.get("entry_pool_address") or ""
+        if pool_id and mint in market and market[mint].get("pool_address") != pool_id:
+            market.pop(mint, None)
+
+    # Fetch quotes for held positions separately from candidate screening.
+    # A held token may fail entry filters (e.g. momentum/volume) but still need
+    # to be priced so exits and portfolio valuation can be managed.
+    for mint in list(state["positions"].keys()):
+        if mint in market:
+            continue
+        pairs = token_pairs(mint)
+        eligible_quote_pairs = [p for p in pairs if p.get("chainId") == "solana"
+                                and (p.get("quoteToken") or {}).get("address") == SOL_MINT
+                                and (p.get("dexId") or "").lower() in SUPPORTED_SOL_ROUTES]
+        pinned = state["positions"][mint].get("entry_pool_address") or ""
+        pair = (next((p for p in eligible_quote_pairs if p.get("pairAddress") == pinned), None)
+                if pinned else best_pair(eligible_quote_pairs))
+        if pair:
+            price = as_float(pair.get("priceUsd"))
+            liquidity = as_float((pair.get("liquidity") or {}).get("usd"))
+            if price > 0:
+                market[mint] = {"price": price, "liquidity": liquidity,
+                                "pool_address": pair.get("pairAddress", "")}
+
+    # If DexScreener has dropped the precise entry pool, check an independent
+    # GeckoTerminal pool endpoint. Do not infer a sell price from another pool.
+    # API readings remain INDICATIVE, not verified executable swaps.
+    for mint, raw in state["positions"].items():
+        if not raw.get("entry_pool_address") or (mint in market and
+            as_float(market[mint].get("price")) > 0 and
+            as_float(market[mint].get("liquidity")) > 0):
+            continue
+        fallback = held_pool_fallback(raw["entry_pool_address"], mint)
+        if fallback:
+            market[mint] = fallback
+            fallback_logged = state.setdefault("fallback_log_times", {})
+            now_log = time.time()
+            if now_log - float(fallback_logged.get(mint, 0)) >= PAPER_FALLBACK_LOG_INTERVAL_SECONDS:
+                log.warning("PAPER POOL FALLBACK mint=%s pool=%s source=geckoterminal valuation_only=no_verified_exit",
+                            mint, raw["entry_pool_address"])
+                fallback_logged[mint] = now_log
+
+    manage_positions(state, market)
+    roll_day_if_needed(state)
+    if should_halt(state):
+        save_state(state)
+        return
+
+    # Price-only quotes for held positions have no score and are not entry candidates.
+    candidates = sorted(
+        (c for c in market.values()
+         if isinstance(c.get("score"), (int, float))
+         and isinstance(c.get("address"), str)),
+        key=lambda c: c["score"],
+        reverse=True,
+    )
+    skipped_entries: Counter = Counter()
+    for c in candidates:
+        if c["score"] < MIN_SCORE:
+            skipped_entries["low_score"] += 1
+            log.info("PAPER ENTRY SKIP %s reason=low_score score=%.1f threshold=%.1f", c["symbol"], c["score"], MIN_SCORE)
+            continue
+        if c["address"] in state["positions"]:
+            skipped_entries["already_held"] += 1
+            log.info("PAPER ENTRY SKIP %s reason=already_held", c["symbol"])
+            continue
+        # Avoid repeatedly re-entering tokens after a completed trade.
+        if c["address"] in state.get("seen_tokens", []):
+            skipped_entries["previously_traded"] += 1
+            log.info("PAPER ENTRY SKIP %s reason=previously_traded", c["symbol"])
+            continue
+        flow_buys = as_float(c.get("m5_buys"))
+        flow_sells = as_float(c.get("m5_sells"))
+        flow = flow_buys / (flow_buys+flow_sells) if flow_buys+flow_sells > 0 else None
+        confirmed, trend_detail = candidate_momentum_confirm(c["address"], as_float(c.get("price")), buy_pressure=flow)
+        if not confirmed:
+            skipped_entries["entry_short_trend"] += 1
+            log.info("PAPER ENTRY SKIP %s reason=entry_short_trend detail=%s", c["symbol"], trend_detail)
+            continue
+        if SNIPER_MODE and PAPER_MODE and PAPER_PREBUY_SELL_CHECK_ENABLED:
+            ok, reason = paper_prebuy_sellability(c)
+            if not ok:
+                skipped_entries["prebuy_sellability"] += 1
+                log.info("PAPER ENTRY REJECT %s mint=%s reason=%s", c["symbol"], c["address"], reason)
+                continue
+            log.info("PAPER SELLABILITY CHECK %s pool=%s result=indicative_only", c["symbol"], c.get("pool_address"))
+        log.info("CANDIDATE %s score=%.1f liq=$%.0f vol5m=$%.0f age=%.1fh %s",
+                 c["symbol"], c["score"], c["liquidity"], c["m5_volume"], c["age_hours"], c["url"])
+        if PAPER_MODE:
+            before = len(state["positions"])
+            paper_buy(state, c)
+            if len(state["positions"]) == before:
+                skipped_entries["buy_not_placed"] += 1
+                log.info("PAPER ENTRY SKIP %s reason=buy_not_placed cash=%.2f slots=%d", c["symbol"], state["cash_usd"], MAX_POSITIONS - before)
+        else:
+            # Live execution is deliberately fail-closed until a tested swap adapter
+            # is installed. Never silently pretend a live order was sent.
+            log.error("LIVE MODE REQUESTED BUT NO VERIFIED EXECUTION ADAPTER IS CONFIGURED. No order sent.")
+            state["halted"] = True
+            break
+        if len(state["positions"]) >= MAX_POSITIONS:
+            skipped_entries["position_limit_reached"] += max(0, len(candidates) - candidates.index(c) - 1)
+            log.info("PAPER ENTRY CAPACITY positions=%d max=%d remaining_candidates=%d", len(state["positions"]), MAX_POSITIONS, len(candidates) - candidates.index(c) - 1)
+            break
+    if candidates:
+        log.info("PAPER ENTRY DECISIONS screened=%d skips=%s", len(candidates), dict(skipped_entries))
+    save_state(state)
+    log.info("Equity≈$%.2f cash=$%.2f positions=%d candidates=%d",
+             equity(state), state["cash_usd"], len(state["positions"]), len(market))
+
+
+def main() -> None:
+    if SNIPER_MODE:
+        log.info("SNIPER MODE DEX paper only: max_age=%.0fm volume5m>=$%.0f buys/sells>=%.2f price5m>=%.1f%% estimated_entry_impact<=%.1f%%; bonding-curve entries blocked",
+                 SNIPER_MAX_AGE_MINUTES, SNIPER_MIN_VOLUME_5M_USD, SNIPER_MIN_BUY_SELL_RATIO, SNIPER_MIN_PRICE_CHANGE_5M_PCT, SNIPER_MAX_ENTRY_IMPACT_PCT)
+    # Explicit import verifies the strategy and execution bridge are deployed together.
+    # Live transaction calls remain disabled until recovery and reconciliation are reviewed.
+    from live_execution import execute_buy, execute_sell  # noqa: F401
+    if os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true":
+        log.critical("LIVE_TRADING_ENABLED must remain false for this staged strategy release. Refusing to start.")
+        raise SystemExit(2)
+    if not PAPER_MODE:
+        log.critical("PAPER_MODE=false, but this release has no live swap signer. Refusing to trade live.")
+        log.critical("Set PAPER_MODE=true. Live mode requires a separately reviewed Jupiter swap adapter.")
+        raise SystemExit(2)
+    state = load_state()
+    start_fresh_launch_feed()
+    start_curve_activity()
+    log.info("Paper state file: %s (existing state, if present, takes precedence over starting capital)", STATE_FILE)
+    log_real_wallet_balance()
+    log.info("Starting in PAPER MODE. Capital=$%.2f; position size=$%.2f; max positions=%d; stop-loss=%.0f%%; take-profit=%.0f%%; trailing stop=%s; min score=%.1f",
+             STARTING_CAPITAL, POSITION_SIZE_USD, MAX_POSITIONS, STOP_LOSS * 100, TAKE_PROFIT * 100,
+             (f"enabled ({TRAILING_STOP:.0%})" if TRAILING_STOP_ENABLED else "disabled"), MIN_SCORE)
+    log.info("This is not a live trading bot. No wallet key is read and no transaction is signed.")
+    last_wallet_check = time.monotonic()
+    while True:
+        try:
+            if time.monotonic() - last_wallet_check >= 300:
+                log_real_wallet_balance()
+                last_wallet_check = time.monotonic()
+            scan_once(state)
+        except KeyboardInterrupt:
+            log.info("Stopped by user.")
+            save_state(state)
+            break
+        except Exception:
+            log.exception("Unexpected scan error; will retry next cycle.")
+        time.sleep(SCAN_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
