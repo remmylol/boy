@@ -6,6 +6,7 @@ from curve_rpc_activity import RpcCurveTradeTracker
 
 
 def test_verified_dex_has_reserved_scan_slots(monkeypatch):
+    monkeypatch.setattr(bot, 'SNIPER_MODE', False)
     monkeypatch.setattr(bot, 'VERIFIED_DEX_RECHECK_QUOTA', 2)
     monkeypatch.setattr(bot, 'FRESH_LAUNCH_SCAN_QUOTA', 3)
     monkeypatch.setattr(bot, '_verified_dex_mints', bot.OrderedDict())

@@ -3,6 +3,7 @@ import bot
 
 
 def test_cooldown_blocks_new_entry_lookups(monkeypatch):
+    monkeypatch.setattr(bot, 'SNIPER_MODE', False)
     monkeypatch.setattr(bot, '_entry_reject_until', bot.OrderedDict())
     monkeypatch.setattr(bot, '_entry_reject_reason', {})
     monkeypatch.setattr(bot, '_verified_dex_mints', bot.OrderedDict())

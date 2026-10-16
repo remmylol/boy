@@ -67,7 +67,8 @@ def test_sniper_quality_discovery_requires_age_volume_and_momentum():
             'pool_created_at': created, 'reserve_in_usd': '20000',
             'volume_usd': {'h1': '25000', 'm5': volume},
             'price_change_percentage': {'m5': change},
-            'base_token_price_usd': '0.02'},
+            'base_token_price_usd': '0.02',
+            'transactions': {'m5': {'buys': 18, 'sells': 12}}},
             'relationships': {
                 'dex': {'data': {'id': 'solana_pump_swap'}},
                 'base_token': {'data': {'id': 'solana_'+MINT}},
