@@ -16,6 +16,53 @@ def is_solana_mint(address: object) -> bool:
     return isinstance(address, str) and 32 <= len(address) <= 44 and all(c in _BASE58 for c in address)
 
 
+def classify_network(value: Any) -> str:
+    """Conservative normalization of explicit FOMO chain identifiers."""
+    if isinstance(value, dict):
+        value = value.get("id", value.get("chainId", value.get("name")))
+    if isinstance(value, bool):
+        return "unknown"
+    if isinstance(value, (int, float)) and value == 1399811149:
+        return "solana"
+    if not isinstance(value, str):
+        return "unknown" if value is None else "other"
+    identifier = value.strip().lower().replace("_", "-")
+    if identifier in {"sol", "solana", "solana-mainnet", "solana-mainnet-beta", "mainnet-beta", "1399811149"}:
+        return "solana"
+    if identifier in {"base", "8453", "ethereum", "eth", "1", "bnb", "bsc", "56", "arc", "5042", "robinhood", "4663"}:
+        return "other"
+    return "unknown" if not identifier else "other"
+
+
+def network_distribution(payload: Any) -> dict[str, int]:
+    """Only safe aggregate network buckets; never print arbitrary API labels."""
+    out = {"solana": 0, "other": 0, "unknown": 0}
+    if not isinstance(payload, dict):
+        return out
+    rows = payload.get("tokens")
+    if not isinstance(rows, list):
+        wrapped = payload.get("data")
+        rows = wrapped.get("tokens") if isinstance(wrapped, dict) else wrapped
+    if not isinstance(rows, list):
+        return out
+    for row in rows:
+        if not isinstance(row, dict):
+            out["unknown"] += 1
+            continue
+        token = row.get("token") if isinstance(row.get("token"), dict) else row
+        network = explicit_network(row, token)
+        out[classify_network(network)] += 1
+    return out
+
+
+def explicit_network(row: dict, token: dict) -> Any:
+    for obj in (row, token):
+        for field in ("network", "chain", "networkId", "chainId"):
+            if field in obj and obj[field] is not None:
+                return obj[field]
+    return None
+
+
 def inspect_fomo_board(payload: Any, *, limit: int = 50) -> tuple[list[str], dict[str, int | str]]:
     """Inspect a FOMO response locally, without network calls or sensitive logging.
 
@@ -61,11 +108,11 @@ def inspect_fomo_board(payload: Any, *, limit: int = 50) -> tuple[list[str], dic
         token = row.get("token")
         if not isinstance(token, dict):
             token = row
-        network = row.get("network") or row.get("chain") or token.get("network") or token.get("chain")
+        network = explicit_network(row, token)
         if network is None:
             stats["missing_network"] += 1
             continue
-        if not isinstance(network, str) or network.strip().lower() not in ("sol", "solana", "solana-mainnet", "solana_mainnet"):
+        if classify_network(network) != "solana":
             stats["non_solana"] += 1
             continue
         stats["solana_rows"] += 1

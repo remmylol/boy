@@ -79,3 +79,39 @@ def test_unavailable_and_network_failure_are_safe(monkeypatch):
     monkeypatch.setattr(bot, '_fomo_cache', _cache())
     monkeypatch.setattr(bot.session,'get',lambda url, **k: Response() if url.endswith('graduated') else (_ for _ in ()).throw(requests.ConnectionError()))
     assert bot.fomo_board_candidates() == {'graduated': [], 'trending': []}
+
+
+def test_numeric_network_id_solana_and_other_chain_rejection():
+    from fomo_boards import inspect_fomo_board, network_distribution
+    payload = {'tokens': [
+        {'networkId': 1399811149, 'token': {'address': M1}},
+        {'network': 'Solana_Mainnet', 'token': {'address': M2}},
+        {'networkId': 8453, 'token': {'address': '0x' + 'a' * 40}},
+        {'network': {'id': 1}, 'token': {'address': M2}},
+        {'network': 'unrecognizedchain', 'token': {'address': M2}},
+        {'token': {'address': M2}},
+    ]}
+    mints, stats = inspect_fomo_board(payload)
+    assert mints == [M1, M2]
+    assert stats['solana_rows'] == 2
+    assert stats['non_solana'] == 3
+    assert stats['missing_network'] == 1
+    assert network_distribution(payload) == {'solana': 2, 'other': 3, 'unknown': 1}
+
+
+def test_network_identifier_mismatch_and_known_evm_address_never_admitted():
+    from fomo_boards import extract_fomo_mints, network_distribution
+    payload = {'data': {'tokens': [
+        {'network': 'base', 'token': {'address': M1}},
+        {'chainId': '1399811149', 'token': {'address': M2}},
+        {'chain': 'ethereum', 'token': {'address': M2}},
+        {'network': 'solana', 'token': {'address': '0x'+'1'*40}},
+    ]}}
+    assert extract_fomo_mints(payload) == [M2]
+    assert network_distribution(payload) == {'solana': 2, 'other': 2, 'unknown': 0}
+
+
+def test_stale_board_remains_untrusted():
+    from fomo_boards import extract_fomo_mints
+    payload = {'source': 'captured', 'tokens': [{'networkId':1399811149, 'token':{'address':M1}}]}
+    assert extract_fomo_mints(payload) == []
