@@ -4,6 +4,7 @@ Discovery hints only: execution eligibility is ALWAYS rechecked with DexScreener
 """
 from __future__ import annotations
 import math
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -28,7 +29,10 @@ def _token_address(rel: dict, included: dict[str, dict]) -> str:
 def extract_quality_pool_mints(payload: dict, *, sol_mint: str,
                                supported_dexes: frozenset[str],
                                min_liquidity_usd: float,
-                               min_volume_1h_usd: float) -> dict[str, float]:
+                               min_volume_1h_usd: float,
+                               sniper_max_age_minutes: float | None = None,
+                               sniper_min_volume_5m_usd: float | None = None,
+                               sniper_min_change_5m_pct: float | None = None) -> dict[str, float]:
     """Select SOL-quoted, supported-DEX, priced liquid pools, by base mint.
 
     Never assume symbols are authoritative; compare the exact SOL mint.
@@ -61,6 +65,28 @@ def extract_quality_pool_mints(payload: dict, *, sol_mint: str,
         price = _number(attr.get("base_token_price_usd"))
         if liq < min_liquidity_usd or v1h < min_volume_1h_usd or price <= 0:
             continue
+        if sniper_max_age_minutes is not None:
+            # Only prioritize pools for which the upstream age is known.
+            created = attr.get("pool_created_at")
+            try:
+                created_at = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+                age_minutes = (datetime.now(timezone.utc) - created_at).total_seconds() / 60.0
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if age_minutes < 0 or age_minutes > sniper_max_age_minutes:
+                continue
+            v5m = _number((attr.get("volume_usd") or {}).get("m5"))
+            if v5m < (sniper_min_volume_5m_usd or 0):
+                continue
+            change_5m = attr.get("price_change_percentage") or {}
+            try:
+                momentum = float(change_5m.get("m5"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(momentum) or momentum < (sniper_min_change_5m_pct or 0):
+                continue
         score = min(liq, 250000.0) + 2.0 * min(v1h, 250000.0)
+        if sniper_max_age_minutes is not None:
+            score += 5.0 * min(v5m, 100000.0) + max(0.0, sniper_max_age_minutes - age_minutes) * 1000.0
         results[base] = max(score, results.get(base, 0.0))
     return results

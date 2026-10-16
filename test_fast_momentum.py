@@ -1,3 +1,12 @@
+import pytest
+
+@pytest.fixture(autouse=True)
+def legacy_momentum_mode(monkeypatch):
+    # These tests exercise the previous momentum strategy, not sniper mode.
+    monkeypatch.setattr(bot, "SNIPER_MODE", False)
+    monkeypatch.setattr(bot, "MAX_PAIR_AGE_HOURS", 6)
+    monkeypatch.setattr(bot, "MOMENTUM_MAX_CHANGE_5M_PCT", 15)
+
 import time
 import bot
 
