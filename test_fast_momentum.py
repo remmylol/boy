@@ -4,6 +4,9 @@ import pytest
 def legacy_momentum_mode(monkeypatch):
     # These tests exercise the previous momentum strategy, not sniper mode.
     monkeypatch.setattr(bot, "SNIPER_MODE", False)
+    # Old-mode tests must not inherit the new established-momentum defaults.
+    monkeypatch.setattr(bot, "MOMENTUM_SWING_MODE", False)
+    monkeypatch.setattr(bot, "MOMENTUM_MIN_VOLUME_5M_USD", 2000)
     monkeypatch.setattr(bot, "MAX_PAIR_AGE_HOURS", 6)
     monkeypatch.setattr(bot, "MOMENTUM_MAX_CHANGE_5M_PCT", 15)
 

@@ -125,6 +125,25 @@ def extract_quality_pool_mints(payload: dict, *, sol_mint: str,
                 reject("trade_flow_insufficient")
                 continue
         score = min(liq, 250000.0) + 2.0 * min(v1h, 250000.0)
+        if discovery_stage == "continuation":
+            # Discovery PRIORITY only. Final entry independently re-fetches
+            # DexScreener market cap, trend, same-pool liquidity and sell depth.
+            # GeckoTerminal's price-change fields are optional; missing values
+            # never become permission to trade.
+            changes = attr.get("price_change_percentage") or {}
+            def change_value(key: str) -> float | None:
+                try:
+                    v = float(changes.get(key))
+                    return v if math.isfinite(v) else None
+                except (TypeError, ValueError):
+                    return None
+            h1, h6 = change_value("h1"), change_value("h6")
+            if h1 is not None and h6 is not None:
+                if h1 < 0 or h6 < 0:
+                    score *= 0.25
+                else:
+                    score += 6000.0 * min(h1, 15.0) + 2000.0 * min(h6, 25.0)
+            score += 12000.0 * min(v1h / max(liq, 1.0), 4.0)
         if sniper_max_age_minutes is not None:
             score += 10.0 * min(v5m, 100000.0)
             score += 2500.0 * min(buys / max(sells, 1.0), 4.0)

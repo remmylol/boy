@@ -16,12 +16,12 @@ class FollowupTests(unittest.TestCase):
             self.assertEqual(bot.paper_entry_profile(s,59)[1],'low_score')
 
     def test_exploration_never_runs_in_live_mode(self):
-        with patch.object(bot,'PAPER_MODE',False), patch.object(bot,'PAPER_EXPLORATION_ENABLED',True):
+        with patch.object(bot,'PAPER_MODE',False), patch.object(bot,'PAPER_EXPLORATION_ENABLED',True), patch.object(bot,'MIN_SCORE',68):
             self.assertEqual(bot.paper_entry_profile(self.state(),62)[0],None)
 
     def test_limits_on_exploration(self):
         s=self.state()
-        with patch.object(bot,'PAPER_MODE',True), patch.object(bot,'PAPER_EXPLORATION_ENABLED',True), patch.object(bot,'PAPER_EXPLORATION_DAILY_LIMIT',2):
+        with patch.object(bot,'PAPER_MODE',True), patch.object(bot,'PAPER_EXPLORATION_ENABLED',True), patch.object(bot,'MIN_SCORE',68), patch.object(bot,'PAPER_EXPLORATION_DAILY_LIMIT',2):
             self.assertEqual(bot.paper_entry_profile(s,62)[0],'exploration')
             s['paper_exploration_fills_today']=2
             self.assertEqual(bot.paper_entry_profile(s,62)[1],'paper_exploration_daily_limit')
