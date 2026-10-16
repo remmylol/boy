@@ -307,7 +307,7 @@ class RpcCurveTradeTracker:
                 tx_budget -= 1
                 try:
                     tx = self._rpc("getTransaction", [signature, {"encoding": "json",
-                                  "commitment": "confirmed", "maxSupportedTransactionVersion": 0}])
+                                  "commitment": "confirmed", "maxSupportedTransactionVersion": 1}])
                 except Exception as exc:
                     attempts += 1
                     if attempts >= 3:
