@@ -36,7 +36,8 @@ def extract_quality_pool_mints(payload: dict, *, sol_mint: str,
                                sniper_min_buy_sell_ratio: float = 1.3,
                                sniper_min_txns_5m: int = 12,
                                sniper_max_change_5m_pct: float = 80.0,
-                               sniper_min_age_minutes: float = 1.0) -> dict[str, float]:
+                               sniper_min_age_minutes: float = 1.0,
+                               discovery_stage: str = "strict") -> dict[str, float]:
     """Select SOL-quoted, supported-DEX, priced liquid pools, by base mint.
 
     Never assume symbols are authoritative; compare the exact SOL mint.
@@ -80,26 +81,30 @@ def extract_quality_pool_mints(payload: dict, *, sol_mint: str,
             if age_minutes < sniper_min_age_minutes or age_minutes > sniper_max_age_minutes:
                 continue
             v5m = _number((attr.get("volume_usd") or {}).get("m5"))
-            if v5m < (sniper_min_volume_5m_usd or 0):
+            if discovery_stage != "watch" and v5m < (sniper_min_volume_5m_usd or 0):
                 continue
             change_5m = attr.get("price_change_percentage") or {}
             try:
                 momentum = float(change_5m.get("m5"))
             except (TypeError, ValueError):
+                if discovery_stage != "watch":
+                    continue
+                momentum = 0.0
+            if discovery_stage != "watch" and (not math.isfinite(momentum) or not (sniper_min_change_5m_pct or 0) <= momentum <= sniper_max_change_5m_pct):
                 continue
-            if not math.isfinite(momentum) or not (sniper_min_change_5m_pct or 0) <= momentum <= sniper_max_change_5m_pct:
-                continue
+            if not math.isfinite(momentum):
+                momentum = 0.0
             txns = ((attr.get("transactions") or {}).get("m5") or {})
             buys = _number(txns.get("buys"))
             sells = _number(txns.get("sells"))
             # No inferred activity: require reported buys AND sells for a meaningful ratio.
-            if buys + sells < sniper_min_txns_5m or sells <= 0 or buys / sells < sniper_min_buy_sell_ratio:
+            if discovery_stage != "watch" and (buys + sells < sniper_min_txns_5m or sells <= 0 or buys / sells < sniper_min_buy_sell_ratio):
                 continue
         score = min(liq, 250000.0) + 2.0 * min(v1h, 250000.0)
         if sniper_max_age_minutes is not None:
             score += 10.0 * min(v5m, 100000.0)
-            score += 2500.0 * min(buys / sells, 4.0)
-            score += 1000.0 * min(momentum, 25.0)
+            score += 2500.0 * min(buys / max(sells, 1.0), 4.0)
+            score += 1000.0 * max(0.0, min(momentum, 25.0))
             score += max(0.0, sniper_max_age_minutes - age_minutes) * 500.0
         results[base] = max(score, results.get(base, 0.0))
     return results

@@ -43,6 +43,8 @@ def test_sniper_source_missing_transaction_metadata_fails_closed():
 def test_sniper_scan_selects_only_prequalified_verified_and_fresh(monkeypatch):
     monkeypatch.setattr(bot,'SNIPER_MODE',True)
     monkeypatch.setattr(bot,'_quality_pool_mints',['quality1','quality2'])
+    monkeypatch.setattr(bot,'_sniper_watchlist',bot.OrderedDict())
+    bot.update_sniper_watchlist({'quality1': 1, 'quality2': 2}, now=100)
     monkeypatch.setattr(bot,'_verified_dex_mints',bot.OrderedDict())
     monkeypatch.setattr(bot,'_entry_reject_until',bot.OrderedDict())
     monkeypatch.setattr(bot,'_entry_reject_reason',{})
