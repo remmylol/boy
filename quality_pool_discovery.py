@@ -39,6 +39,7 @@ def extract_quality_pool_mints(payload: dict, *, sol_mint: str,
                                sniper_max_change_5m_pct: float = 80.0,
                                sniper_min_age_minutes: float = 1.0,
                                discovery_stage: str = "strict",
+                               discovery_min_market_cap_usd: float = 0.0,
                                rejection_counts: Counter | None = None) -> dict[str, float]:
     """Select SOL-quoted, supported-DEX, priced liquid pools, by base mint.
 
@@ -85,6 +86,14 @@ def extract_quality_pool_mints(payload: dict, *, sol_mint: str,
         if price <= 0:
             reject("missing_price")
             continue
+        if discovery_stage == "continuation" and discovery_min_market_cap_usd > 0:
+            # GeckoTerminal sometimes supplies market-cap/FDV directly. When
+            # present, avoid spending scarce market lookups on tiny tokens.
+            # Never infer missing capitalization from liquidity or price.
+            cap = _number(attr.get("market_cap_usd")) or _number(attr.get("fdv_usd"))
+            if cap > 0 and cap < discovery_min_market_cap_usd:
+                reject("below_established_cap")
+                continue
         if sniper_max_age_minutes is not None:
             # Only prioritize pools for which the upstream age is known.
             created = attr.get("pool_created_at")
@@ -137,13 +146,17 @@ def extract_quality_pool_mints(payload: dict, *, sol_mint: str,
                     return v if math.isfinite(v) else None
                 except (TypeError, ValueError):
                     return None
-            h1, h6 = change_value("h1"), change_value("h6")
+            m5, h1, h6, h24 = (change_value(k) for k in ("m5", "h1", "h6", "h24"))
+            # These are PRIORITY hints only. The entry filter still enforces
+            # the complete trend and price/volume rules from fresh market data.
             if h1 is not None and h6 is not None:
-                if h1 < 0 or h6 < 0:
-                    score *= 0.25
+                if h1 < 0 or h6 < 0 or (h24 is not None and h24 < 0):
+                    score *= 0.1
                 else:
-                    score += 6000.0 * min(h1, 15.0) + 2000.0 * min(h6, 25.0)
-            score += 12000.0 * min(v1h / max(liq, 1.0), 4.0)
+                    score += 8500.0 * min(h1, 15.0) + 3000.0 * min(h6, 25.0)
+            if m5 is not None:
+                score += 4000.0 * max(-2.0, min(m5, 5.0))
+            score += 14000.0 * min(v1h / max(liq, 1.0), 4.0)
         if sniper_max_age_minutes is not None:
             score += 10.0 * min(v5m, 100000.0)
             score += 2500.0 * min(buys / max(sells, 1.0), 4.0)

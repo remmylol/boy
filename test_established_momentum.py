@@ -114,6 +114,7 @@ def test_choose_trending_pool_over_deeper_downtrend_pool():
 
 def test_trending_gecko_source_multiple_pages_and_no_new_pools(monkeypatch):
     monkeypatch.setattr(bot, "MOMENTUM_TRENDING_POOL_PAGES", 3)
+    monkeypatch.setattr(bot, "MOMENTUM_TOP_POOL_PAGES", 0)
     monkeypatch.setattr(bot, "QUALITY_POOL_DISCOVERY_ENABLED", True)
     monkeypatch.setattr(bot, "_quality_cache", {"until": 0, "mints": [], "scores": {}})
     calls=[]
