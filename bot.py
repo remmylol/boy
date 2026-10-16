@@ -47,14 +47,14 @@ PAPER_EXPLORATION_POSITION_SIZE_USD = min(POSITION_SIZE_USD, max(5., float(os.ge
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
 MIN_SOL_PAIR_LIQUIDITY_USD = max(5000.0, float(os.getenv("MIN_SOL_PAIR_LIQUIDITY_USD", "5000")))
 MIN_VOLUME_5M_USD = float(os.getenv("MIN_VOLUME_5M_USD", "1000"))
-MAX_PAIR_AGE_HOURS = float(os.getenv("MAX_PAIR_AGE_HOURS", "0.5"))
+MAX_PAIR_AGE_HOURS = float(os.getenv("MAX_PAIR_AGE_HOURS", "256"))
 MIN_PAIR_AGE_MINUTES = float(os.getenv("MIN_PAIR_AGE_MINUTES", "1"))
 FAST_MOMENTUM_ENABLED = os.getenv("FAST_MOMENTUM_ENABLED", "true").lower() == "true"
 # Default to established-token momentum rather than fresh-launch sniping.
 # Explicit momentum selection takes precedence over a stale Railway SNIPER_MODE=true.
 MOMENTUM_SWING_MODE = os.getenv("MOMENTUM_SWING_MODE", "true").lower() == "true"
 SNIPER_MODE = (not MOMENTUM_SWING_MODE and os.getenv("SNIPER_MODE", "false").lower() == "true")
-MOMENTUM_MARKET_CAP_MIN_USD = max(0.0, float(os.getenv("MOMENTUM_MARKET_CAP_MIN_USD", "500000")))
+MOMENTUM_MARKET_CAP_MIN_USD = max(0.0, float(os.getenv("MOMENTUM_MARKET_CAP_MIN_USD", "200000")))
 MOMENTUM_MARKET_CAP_MAX_USD = max(MOMENTUM_MARKET_CAP_MIN_USD, float(os.getenv("MOMENTUM_MARKET_CAP_MAX_USD", "50000000")))
 MOMENTUM_ALLOW_FDV_FALLBACK = os.getenv("MOMENTUM_ALLOW_FDV_FALLBACK", "true").lower() == "true"
 MOMENTUM_MIN_LIQUIDITY_USD = max(5000.0, float(os.getenv("MOMENTUM_MIN_LIQUIDITY_USD", "20000")))
